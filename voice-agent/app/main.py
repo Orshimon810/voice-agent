@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -34,9 +33,10 @@ _VALID_DECISIONS = {member.value for member in PassengerDecision}
 
 
 def _find_structured_result(structured: dict[str, Any] | None, name: str) -> str | None:
-    """Look up a value in Vapi's structuredData, keyed by random UUIDs.
+    """Look up a value in one of Vapi's UUID-keyed structured field maps
+    (e.g. message.structuredOutputs).
 
-    Each entry is shaped like {"name": <field name>, "result": <value>}
+    Each entry is shaped like {"name": <field name>, "result": <value>, ...}
     rather than the field name being the dict key directly.
     """
     if not structured:
@@ -50,8 +50,7 @@ def _find_structured_result(structured: dict[str, Any] | None, name: str) -> str
 
 
 def _extract_decision(message: VapiMessage) -> str:
-    structured = message.analysis.structuredData if message.analysis else None
-    decision = _find_structured_result(structured, "decision")
+    decision = _find_structured_result(message.structuredOutputs, "decision")
     if decision is not None and decision in _VALID_DECISIONS:
         return decision
     return PassengerDecision.undecided.value
@@ -233,13 +232,6 @@ async def vapi_webhook(
 
     try:
         raw_body: Any = await request.json()
-        # TODO(debug): temporary, remove after diagnosing structured-data shape mismatch.
-        log_event(
-            logger,
-            logging.INFO,
-            "webhook_raw_payload_debug",
-            raw_body=json.dumps(raw_body, ensure_ascii=False),
-        )
         payload = VapiWebhookPayload.model_validate(raw_body)
     except (ValueError, ValidationError):
         # Malformed JSON or an unexpected shape. Never let Vapi see a 5xx (or
@@ -267,13 +259,7 @@ async def vapi_webhook(
         log_event(logger, logging.WARNING, "webhook_record_not_found", call_id=call_id)
         return {"status": "ignored"}
 
-    structured = message.analysis.structuredData if message.analysis else None
-    summary = (
-        message.summary
-        or _find_structured_result(structured, "summary")
-        or (message.analysis.summary if message.analysis else None)
-        or ""
-    )
+    summary = _find_structured_result(message.structuredOutputs, "summary") or message.summary or ""
     fields = {
         "call_status": _map_ended_reason(message.endedReason),
         "passenger_decision": _extract_decision(message),
