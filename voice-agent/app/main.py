@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -243,6 +244,17 @@ async def vapi_webhook(
     message = payload.message
     if message is None or message.type != "end-of-call-report":
         return {"status": "ignored"}
+
+    # TODO(debug): temporary, remove after confirming structuredOutputs parsing matches raw payload.
+    log_event(
+        logger,
+        logging.INFO,
+        "webhook_structured_outputs_debug",
+        raw_structured_outputs=json.dumps(
+            raw_body.get("message", {}).get("structuredOutputs"), ensure_ascii=False
+        ),
+        parsed_structured_outputs=json.dumps(message.structuredOutputs, ensure_ascii=False),
+    )
 
     call_id = message.call.id if message.call else None
     if not call_id:
