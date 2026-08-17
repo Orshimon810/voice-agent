@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -232,6 +233,13 @@ async def vapi_webhook(
 
     try:
         raw_body: Any = await request.json()
+        # TODO(debug): temporary, remove after diagnosing structured-data shape mismatch.
+        log_event(
+            logger,
+            logging.INFO,
+            "webhook_raw_payload_debug",
+            raw_body=json.dumps(raw_body, ensure_ascii=False),
+        )
         payload = VapiWebhookPayload.model_validate(raw_body)
     except (ValueError, ValidationError):
         # Malformed JSON or an unexpected shape. Never let Vapi see a 5xx (or
