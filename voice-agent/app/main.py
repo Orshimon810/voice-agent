@@ -60,9 +60,11 @@ def _extract_decision(message: VapiMessage) -> str:
 # Vapi computes structuredOutputs asynchronously after end-of-call-report
 # fires and does not send a second webhook once it's ready, so it's
 # genuinely absent from the payload at delivery time. Poll GET /call/{id}
-# a few times instead, staying well under Vapi's 20s webhook response
-# timeout (3 attempts * 3s delay = 9s worst case, before request latency).
-_STRUCTURED_OUTPUTS_POLL_ATTEMPTS = 3
+# a few times instead, staying under Vapi's 20s webhook response timeout
+# (5 attempts * 3s delay = 15s worst case, before request latency). 9s
+# (3 attempts) was empirically observed to be insufficient in production —
+# structuredOutputs was still missing after that window.
+_STRUCTURED_OUTPUTS_POLL_ATTEMPTS = 5
 _STRUCTURED_OUTPUTS_POLL_DELAY_SECONDS = 3.0
 
 
