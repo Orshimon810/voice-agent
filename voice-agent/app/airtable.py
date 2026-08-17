@@ -96,13 +96,5 @@ class AirtableClient:
             "PATCH", f"{self._base_url}/{record_id}", json={"fields": fields}
         )
         if response.status_code >= 400:
-            # TODO(debug): temporary, remove after diagnosing update-record failures.
-            log_event(
-                logger,
-                logging.ERROR,
-                "airtable_update_error_response_body",
-                status_code=response.status_code,
-                response_body=response.text,
-            )
             log_event(logger, logging.ERROR, "airtable_error", status_code=response.status_code)
             raise AirtableError(f"Airtable request failed with status {response.status_code}")
