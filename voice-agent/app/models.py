@@ -77,6 +77,8 @@ class HealthResponse(BaseModel):
 # make sense of and always returns 200.
 class VapiCall(BaseModel):
     id: str | None = None
+    startedAt: str | None = None
+    endedAt: str | None = None
 
 
 class VapiAnalysis(BaseModel):
@@ -92,6 +94,8 @@ class VapiMessage(BaseModel):
     transcript: str | None = None
     recordingUrl: str | None = None
     analysis: VapiAnalysis | None = None
+    startedAt: str | None = None
+    endedAt: str | None = None
 
 
 class VapiWebhookPayload(BaseModel):
