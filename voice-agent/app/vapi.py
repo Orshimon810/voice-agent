@@ -52,6 +52,18 @@ class VapiClient:
             "customer": {"number": customer_number},
             "assistantOverrides": {"variableValues": variable_values},
         }
+        # TODO(debug): temporary, remove after diagnosing call-creation issue.
+        log_event(
+            logger,
+            logging.INFO,
+            "vapi_create_call_payload",
+            assistant_id=payload["assistantId"],
+            phone_number_id=payload["phoneNumberId"],
+            customer_number=payload["customer"]["number"],
+            has_assistant_overrides="assistantOverrides" in payload,
+            variable_values_keys=list(variable_values.keys()) if variable_values else [],
+            authorization_header_present="Authorization" in self._headers,
+        )
         try:
             response = await self._request("POST", f"{_BASE_URL}/call", json=payload)
         except (httpx.TransportError, httpx.HTTPStatusError) as exc:
