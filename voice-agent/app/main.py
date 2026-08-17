@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from collections.abc import AsyncIterator
@@ -55,6 +56,49 @@ def _extract_decision(message: VapiMessage) -> str:
     if decision is not None and decision in _VALID_DECISIONS:
         return decision
     return PassengerDecision.undecided.value
+
+
+# Vapi computes structuredOutputs asynchronously after end-of-call-report
+# fires and does not send a second webhook once it's ready, so it's
+# genuinely absent from the payload at delivery time. Poll GET /call/{id}
+# a few times instead, staying well under Vapi's 20s webhook response
+# timeout (3 attempts * 3s delay = 9s worst case, before request latency).
+_STRUCTURED_OUTPUTS_POLL_ATTEMPTS = 3
+_STRUCTURED_OUTPUTS_POLL_DELAY_SECONDS = 3.0
+
+
+async def _poll_for_structured_outputs(
+    vapi_client: VapiClient, call_id: str
+) -> dict[str, dict[str, Any]] | None:
+    for attempt in range(1, _STRUCTURED_OUTPUTS_POLL_ATTEMPTS + 1):
+        await asyncio.sleep(_STRUCTURED_OUTPUTS_POLL_DELAY_SECONDS)
+        try:
+            call = await vapi_client.get_call(call_id)
+        except VapiError:
+            log_event(
+                logger,
+                logging.WARNING,
+                "webhook_structured_outputs_poll_request_failed",
+                call_id=call_id,
+                attempt=attempt,
+            )
+            continue
+
+        structured_outputs = call.get("structuredOutputs") if isinstance(call, dict) else None
+        if structured_outputs:
+            log_event(
+                logger,
+                logging.INFO,
+                "webhook_structured_outputs_poll_succeeded",
+                call_id=call_id,
+                attempt=attempt,
+            )
+            return structured_outputs
+
+    log_event(
+        logger, logging.WARNING, "webhook_structured_outputs_poll_exhausted", call_id=call_id
+    )
+    return None
 
 
 def _parse_timestamp(value: str | None) -> datetime | None:
@@ -225,6 +269,7 @@ async def trigger_call(
 async def vapi_webhook(
     request: Request,
     airtable_client: AirtableClient = Depends(get_airtable_client),
+    vapi_client: VapiClient = Depends(get_vapi_client),
     settings: Settings = Depends(get_settings),
     x_vapi_secret: str | None = Header(default=None),
 ) -> dict[str, str]:
@@ -270,6 +315,11 @@ async def vapi_webhook(
     if record is None:
         log_event(logger, logging.WARNING, "webhook_record_not_found", call_id=call_id)
         return {"status": "ignored"}
+
+    if not message.structuredOutputs:
+        polled = await _poll_for_structured_outputs(vapi_client, call_id)
+        if polled:
+            message.structuredOutputs = polled
 
     summary = _find_structured_result(message.structuredOutputs, "summary") or message.summary or ""
     fields = {
