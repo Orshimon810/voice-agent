@@ -4,10 +4,10 @@ import logging
 from typing import Any
 
 import httpx
-from tenacity import retry, retry_if_exception, stop_after_attempt, wait_exponential
 
 from app.config import Settings
 from app.models import PassengerRecord
+from app.retry import retry_transient
 
 logger = logging.getLogger(__name__)
 
@@ -16,20 +16,6 @@ _TIMEOUT = httpx.Timeout(connect=5.0, read=10.0, write=10.0, pool=5.0)
 
 class AirtableError(Exception):
     """Raised when Airtable cannot fulfil a request after retries."""
-
-
-def _is_retryable(exc: BaseException) -> bool:
-    if isinstance(exc, httpx.HTTPStatusError):
-        return exc.response.status_code >= 500
-    return isinstance(exc, httpx.TransportError)
-
-
-_retry_transient = retry(
-    reraise=True,
-    stop=stop_after_attempt(4),
-    wait=wait_exponential(multiplier=0.5, min=0.5, max=8),
-    retry=retry_if_exception(_is_retryable),
-)
 
 
 def parse_passenger_record(record: dict[str, Any]) -> PassengerRecord:
@@ -68,7 +54,7 @@ class AirtableClient:
         if self._owns_client:
             await self._client.aclose()
 
-    @_retry_transient
+    @retry_transient
     async def _request(self, method: str, url: str, **kwargs: Any) -> httpx.Response:
         response = await self._client.request(method, url, headers=self._headers, **kwargs)
         if response.status_code >= 500:
