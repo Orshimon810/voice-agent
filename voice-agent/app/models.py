@@ -18,6 +18,7 @@ class PassengerDecision(str, Enum):
     alternative_flight = "alternative_flight"
     refund = "refund"
     human_agent = "human_agent"
+    callback_requested = "callback_requested"
     undecided = "undecided"
 
 

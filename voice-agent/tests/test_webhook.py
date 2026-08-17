@@ -191,6 +191,20 @@ def test_webhook_missing_structured_data_defaults_to_undecided(client: TestClien
     assert fake_airtable.updates[0][1]["passenger_decision"] == "undecided"
 
 
+def test_webhook_recognizes_callback_requested_decision(client: TestClient) -> None:
+    fake_airtable = FakeAirtableClient(SAMPLE_RECORD)
+    app.dependency_overrides[get_airtable_client] = lambda: fake_airtable
+
+    response = client.post(
+        "/webhooks/vapi",
+        json=_end_of_call_report(structured_data={"decision": "callback_requested"}),
+        headers={"x-vapi-secret": "secret"},
+    )
+
+    assert response.status_code == 200
+    assert fake_airtable.updates[0][1]["passenger_decision"] == "callback_requested"
+
+
 def test_webhook_unrecognized_decision_defaults_to_undecided(client: TestClient) -> None:
     fake_airtable = FakeAirtableClient(SAMPLE_RECORD)
     app.dependency_overrides[get_airtable_client] = lambda: fake_airtable
