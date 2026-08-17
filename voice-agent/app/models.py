@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from enum import Enum
+from typing import Literal
 
 from pydantic import BaseModel
 
@@ -53,3 +54,17 @@ class PassengerResponse(BaseModel):
 
     raw: PassengerRecord
     normalized: NormalizedFields
+
+
+class CallTriggerRequest(BaseModel):
+    record_id: str
+    mode: Literal["web", "phone"]
+
+
+class CallTriggerResponse(BaseModel):
+    call_id: str | None
+    variable_values: dict[str, str]
+
+
+class HealthResponse(BaseModel):
+    status: str

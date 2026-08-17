@@ -6,6 +6,7 @@ from typing import Any
 import httpx
 
 from app.config import Settings
+from app.logging_config import log_event
 from app.retry import retry_transient
 
 logger = logging.getLogger(__name__)
@@ -54,11 +55,11 @@ class VapiClient:
         try:
             response = await self._request("POST", f"{_BASE_URL}/call", json=payload)
         except (httpx.TransportError, httpx.HTTPStatusError) as exc:
-            logger.error("vapi_request_failed", extra={"url": "/call"})
+            log_event(logger, logging.ERROR, "vapi_request_failed", url="/call")
             raise VapiError("Vapi is unavailable") from exc
 
         if response.status_code >= 400:
-            logger.error("vapi_error", extra={"status_code": response.status_code})
+            log_event(logger, logging.ERROR, "vapi_error", status_code=response.status_code)
             raise VapiError(f"Vapi request failed with status {response.status_code}")
 
         return response.json()
