@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from enum import Enum
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel
 
@@ -68,3 +68,30 @@ class CallTriggerResponse(BaseModel):
 
 class HealthResponse(BaseModel):
     status: str
+
+
+# Vapi's end-of-call-report webhook payload. Fields are optional/lenient so a
+# partial or slightly-off payload doesn't fail validation and turn into a 5xx
+# (which would trigger Vapi retries) — the handler ignores anything it can't
+# make sense of and always returns 200.
+class VapiCall(BaseModel):
+    id: str | None = None
+
+
+class VapiAnalysis(BaseModel):
+    summary: str | None = None
+    structuredData: dict[str, Any] | None = None
+
+
+class VapiMessage(BaseModel):
+    type: str | None = None
+    endedReason: str | None = None
+    call: VapiCall | None = None
+    summary: str | None = None
+    transcript: str | None = None
+    recordingUrl: str | None = None
+    analysis: VapiAnalysis | None = None
+
+
+class VapiWebhookPayload(BaseModel):
+    message: VapiMessage | None = None
