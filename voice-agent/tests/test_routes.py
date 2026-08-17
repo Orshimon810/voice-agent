@@ -1,8 +1,6 @@
-import pytest
 from fastapi.testclient import TestClient
 
 from app.airtable import AirtableError
-from app.config import get_settings
 from app.main import app, get_airtable_client, get_vapi_client
 from app.models import PassengerRecord
 from app.vapi import VapiError
@@ -50,25 +48,6 @@ class FakeVapiClient:
 class FailingVapiClient:
     async def create_call(self, **kwargs: object) -> dict:
         raise VapiError("boom")
-
-
-@pytest.fixture
-def env_settings(monkeypatch: pytest.MonkeyPatch):
-    monkeypatch.setenv("AIRTABLE_TOKEN", "test-token")
-    monkeypatch.setenv("VAPI_API_KEY", "vapi-key")
-    monkeypatch.setenv("VAPI_ASSISTANT_ID", "assistant-id")
-    monkeypatch.setenv("VAPI_PHONE_NUMBER_ID", "phone-id")
-    monkeypatch.setenv("WEBHOOK_SECRET", "secret")
-    get_settings.cache_clear()
-    yield
-    get_settings.cache_clear()
-
-
-@pytest.fixture
-def client(env_settings: None):
-    with TestClient(app) as test_client:
-        yield test_client
-    app.dependency_overrides.clear()
 
 
 def test_health(client: TestClient) -> None:
