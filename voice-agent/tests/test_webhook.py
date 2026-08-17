@@ -131,10 +131,8 @@ def _transcript_message(
 
 
 def _fallback_summary(name: str | None = None, flight: str | None = None) -> str:
-    """Expected deterministic fallback summary for an undecided outcome
-    with no transcript signal, matching _extract_summary_from_transcript's
-    template exactly (kept independent of the implementation on purpose, so
-    a regression in the template shows up here rather than only visually)."""
+    """Expected undecided-fallback summary, kept independent of
+    _extract_summary_from_transcript's template on purpose."""
     subject = f"הנוסע {name}" if name else "הנוסע"
     flight_clause = f" בטיסה {flight}" if flight else ""
     label = _DECISION_HEBREW_LABELS[PassengerDecision.undecided.value]
@@ -506,10 +504,8 @@ def test_extract_decision_from_transcript_case_insensitive_for_latin_text() -> N
 
 # --- definite article (ה-) normalization -------------------------------------
 # Regression coverage for a real production miss: "הטיסה החלופית" (article
-# prefixed to both words) didn't match the phrase "טיסה חלופית" at all,
-# since the phrase list has no article and substring matching is literal.
-# These stand alone (no other matching phrase in the sentence) specifically
-# so they can only pass via the article-stripping normalization, not by
+# on both words) didn't match plain "טיסה חלופית". Each sentence below
+# stands alone, so it can only pass via article-stripping, not by
 # accidentally matching some other phrase already in the list.
 
 

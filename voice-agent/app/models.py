@@ -71,17 +71,15 @@ class HealthResponse(BaseModel):
     status: str
 
 
-# Vapi's end-of-call-report webhook payload. Fields are optional/lenient so a
-# partial or slightly-off payload doesn't fail validation and turn into a 5xx
-# (which would trigger Vapi retries) — the handler ignores anything it can't
-# make sense of and always returns 200.
+# Vapi's end-of-call-report payload. Fields are optional/lenient so a
+# partial payload doesn't fail validation and trigger a 5xx (and Vapi
+# retries) — the handler ignores what it can't use and always returns 200.
 class VapiCall(BaseModel):
     id: str | None = None
     startedAt: str | None = None
     endedAt: str | None = None
-    # Echoes back the variableValues passed at call-creation time (see
-    # app.main._build_variable_values) — the only place passenger
-    # name/flight context is available from within the webhook payload.
+    # Echoes back variableValues from call creation (see
+    # app.main._build_variable_values) — passenger name/flight context.
     assistantOverrides: dict[str, Any] | None = None
 
 
@@ -110,10 +108,9 @@ class VapiMessage(BaseModel):
     artifact: VapiArtifact | None = None
     startedAt: str | None = None
     endedAt: str | None = None
-    # Top-level, sibling to "analysis" — not nested inside it. Random-UUID
-    # keys, each value shaped like {"name": ..., "result": ..., "compliancePlan": ...}.
-    # Computed asynchronously by Vapi and often absent at webhook delivery
-    # time — see _extract_decision_from_transcript for the reliable path.
+    # Sibling of "analysis", not nested in it. UUID keys, each value like
+    # {"name": ..., "result": ...}. Often absent at delivery time — see
+    # _extract_decision_from_transcript for the reliable path.
     structuredOutputs: dict[str, dict[str, Any]] | None = None
 
 
