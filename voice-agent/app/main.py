@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -51,55 +50,140 @@ def _find_structured_result(structured: dict[str, Any] | None, name: str) -> str
 
 
 def _extract_decision(message: VapiMessage) -> str:
+    """structuredOutputs-based decision, when Vapi happens to have computed
+    it in time. Computed asynchronously and frequently absent at webhook
+    delivery time (even after polling GET /call/{id} for 15s in production)
+    — treat this as a bonus override, not the primary source. See
+    _extract_decision_from_transcript for the path that's actually reliable.
+    """
     decision = _find_structured_result(message.structuredOutputs, "decision")
     if decision is not None and decision in _VALID_DECISIONS:
         return decision
     return PassengerDecision.undecided.value
 
 
-# Vapi computes structuredOutputs asynchronously after end-of-call-report
-# fires and does not send a second webhook once it's ready, so it's
-# genuinely absent from the payload at delivery time. Poll GET /call/{id}
-# a few times instead, staying under Vapi's 20s webhook response timeout
-# (5 attempts * 3s delay = 15s worst case, before request latency). 9s
-# (3 attempts) was empirically observed to be insufficient in production —
-# structuredOutputs was still missing after that window.
-_STRUCTURED_OUTPUTS_POLL_ATTEMPTS = 5
-_STRUCTURED_OUTPUTS_POLL_DELAY_SECONDS = 3.0
+# Pragmatic substring-matching heuristic, not NLP: Hebrew has no lightweight,
+# dependency-free stemming library available here, and speech-to-text
+# transcripts are short/conversational enough that a curated phrase list
+# covers the realistic ways a passenger states each choice. Phrases are
+# matched as substrings against normalized (punctuation-stripped,
+# whitespace-collapsed) text, so they don't need to be whole-word/sentence
+# matches — "אני רוצה את הכסף בחזרה" still matches "רוצה את הכסף".
+_DECISION_PHRASES: dict[str, list[str]] = {
+    PassengerDecision.alternative_flight.value: [
+        "טיסה חלופית",
+        "אני רוצה את הטיסה",
+        "החלופית מתאימה",
+        "טיסה אחרת",
+    ],
+    PassengerDecision.refund.value: [
+        "החזר כספי",
+        "החזר",
+        "כסף בחזרה",
+        "רוצה את הכסף",
+    ],
+    PassengerDecision.human_agent.value: [
+        "נציג",
+        "לדבר עם מישהו",
+        "אדם אמיתי",
+        "העבירו אותי",
+    ],
+    PassengerDecision.callback_requested.value: [
+        "לחשוב",
+        "תתקשרו",
+        "אחר כך",
+        "לא כרגע",
+        "אין לי זמן",
+    ],
+}
+
+_DECISION_HEBREW_LABELS: dict[str, str] = {
+    PassengerDecision.alternative_flight.value: "טיסה חלופית",
+    PassengerDecision.refund.value: "החזר כספי",
+    PassengerDecision.human_agent.value: "שיחה עם נציג",
+    PassengerDecision.callback_requested.value: "בקשה לחזור אליו מאוחר יותר",
+    PassengerDecision.undecided.value: "החלטה שלא הובעה בבירור",
+}
+
+_PUNCTUATION_TRANSLATION = str.maketrans("", "", "\".,!?;:'׳״()־-")
 
 
-async def _poll_for_structured_outputs(
-    vapi_client: VapiClient, call_id: str
-) -> dict[str, dict[str, Any]] | None:
-    for attempt in range(1, _STRUCTURED_OUTPUTS_POLL_ATTEMPTS + 1):
-        await asyncio.sleep(_STRUCTURED_OUTPUTS_POLL_DELAY_SECONDS)
-        try:
-            call = await vapi_client.get_call(call_id)
-        except VapiError:
-            log_event(
-                logger,
-                logging.WARNING,
-                "webhook_structured_outputs_poll_request_failed",
-                call_id=call_id,
-                attempt=attempt,
-            )
-            continue
+def _normalize_hebrew_text(text: str) -> str:
+    stripped = text.translate(_PUNCTUATION_TRANSLATION).lower()
+    return " ".join(stripped.split())
 
-        structured_outputs = call.get("structuredOutputs") if isinstance(call, dict) else None
-        if structured_outputs:
-            log_event(
-                logger,
-                logging.INFO,
-                "webhook_structured_outputs_poll_succeeded",
-                call_id=call_id,
-                attempt=attempt,
-            )
-            return structured_outputs
 
-    log_event(
-        logger, logging.WARNING, "webhook_structured_outputs_poll_exhausted", call_id=call_id
+def _user_transcript_turns(message: VapiMessage) -> list[str]:
+    if not message.artifact or not message.artifact.messages:
+        return []
+    return [
+        turn.message for turn in message.artifact.messages if turn.role == "user" and turn.message
+    ]
+
+
+def _extract_decision_from_transcript(message: VapiMessage) -> str:
+    """Classify the passenger's decision from what they actually said,
+    since the full transcript (message.artifact.messages) is reliably
+    present at webhook delivery time, unlike structuredOutputs.
+
+    Scans every candidate phrase across all categories and picks whichever
+    one's last occurrence sits latest in the (normalized) user transcript —
+    "most recent expressed intent wins" — so a passenger asking about an
+    option before ultimately choosing something else still resolves
+    correctly.
+    """
+    user_turns = _user_transcript_turns(message)
+    if not user_turns:
+        return PassengerDecision.undecided.value
+
+    transcript_text = _normalize_hebrew_text(" ".join(user_turns))
+
+    best_decision: str | None = None
+    best_position = -1
+    for decision, phrases in _DECISION_PHRASES.items():
+        for phrase in phrases:
+            position = transcript_text.rfind(_normalize_hebrew_text(phrase))
+            if position > best_position:
+                best_position = position
+                best_decision = decision
+
+    return best_decision if best_decision is not None else PassengerDecision.undecided.value
+
+
+def _call_variable_values(message: VapiMessage) -> dict[str, Any]:
+    if not message.call or not message.call.assistantOverrides:
+        return {}
+    variable_values = message.call.assistantOverrides.get("variableValues")
+    return variable_values if isinstance(variable_values, dict) else {}
+
+
+def _extract_summary_from_transcript(message: VapiMessage, decision: str | None = None) -> str:
+    """Deterministic, template-based Hebrew summary — no external/AI calls.
+    Passenger name and flight number come from call.assistantOverrides
+    (Vapi echoes back the variableValues used to create the call; see
+    _build_variable_values), falling back to generic phrasing when absent.
+
+    `decision`, if given, is the already-resolved final decision (e.g. from
+    a structuredOutputs bonus override) so the summary stays consistent
+    with whatever was actually written to passenger_decision, rather than
+    silently re-deriving a possibly different one from the transcript alone.
+    """
+    if decision is None:
+        decision = _extract_decision_from_transcript(message)
+    decision_label = _DECISION_HEBREW_LABELS.get(
+        decision, _DECISION_HEBREW_LABELS[PassengerDecision.undecided.value]
     )
-    return None
+
+    variable_values = _call_variable_values(message)
+    name = variable_values.get("passenger_name")
+    flight = variable_values.get("flight_number")
+    subject = f"הנוסע {name}" if name else "הנוסע"
+    flight_clause = f" בטיסה {flight}" if flight else ""
+
+    return (
+        f"{subject} התבקש לבחור בין טיסה חלופית להחזר כספי בעקבות עיכוב"
+        f"{flight_clause}, ובחר ב{decision_label}."
+    )
 
 
 def _parse_timestamp(value: str | None) -> datetime | None:
@@ -270,7 +354,6 @@ async def trigger_call(
 async def vapi_webhook(
     request: Request,
     airtable_client: AirtableClient = Depends(get_airtable_client),
-    vapi_client: VapiClient = Depends(get_vapi_client),
     settings: Settings = Depends(get_settings),
     x_vapi_secret: str | None = Header(default=None),
 ) -> dict[str, str]:
@@ -306,15 +389,27 @@ async def vapi_webhook(
         log_event(logger, logging.WARNING, "webhook_record_not_found", call_id=call_id)
         return {"status": "ignored"}
 
-    if not message.structuredOutputs:
-        polled = await _poll_for_structured_outputs(vapi_client, call_id)
-        if polled:
-            message.structuredOutputs = polled
+    # structuredOutputs, when Vapi happens to have computed it in time, is a
+    # bonus override — transcript analysis is the reliable, always-available
+    # path (see _extract_decision for why structuredOutputs can't be trusted
+    # as primary).
+    decision = _extract_decision(message)
+    if decision == PassengerDecision.undecided.value:
+        decision = _extract_decision_from_transcript(message)
 
-    summary = _find_structured_result(message.structuredOutputs, "summary") or message.summary or ""
+    # Pass the already-resolved `decision` through so the generated summary
+    # (if it comes to that) describes the same outcome that was just
+    # written to passenger_decision, not a possibly different one re-derived
+    # from the transcript alone.
+    summary = (
+        _find_structured_result(message.structuredOutputs, "summary")
+        or message.summary
+        or _extract_summary_from_transcript(message, decision=decision)
+    )
+
     fields = {
         "call_status": _map_ended_reason(message.endedReason),
-        "passenger_decision": _extract_decision(message),
+        "passenger_decision": decision,
         "call_summary": summary,
         "call_timestamp": _extract_call_timestamp(message),
         "recording_url": message.recordingUrl or "",

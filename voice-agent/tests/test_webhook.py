@@ -1,19 +1,27 @@
 import re
-from typing import Any
 
 from fastapi.testclient import TestClient
 
 from app.airtable import AirtableError
 from app.main import (
+    _DECISION_HEBREW_LABELS,
     _extract_call_timestamp,
     _extract_decision,
+    _extract_decision_from_transcript,
+    _extract_summary_from_transcript,
     _find_structured_result,
     app,
     get_airtable_client,
-    get_vapi_client,
 )
-from app.models import PassengerDecision, PassengerRecord, VapiAnalysis, VapiCall, VapiMessage
-from app.vapi import VapiError
+from app.models import (
+    PassengerDecision,
+    PassengerRecord,
+    VapiAnalysis,
+    VapiArtifact,
+    VapiArtifactMessage,
+    VapiCall,
+    VapiMessage,
+)
 
 _ISO8601_UTC_MS = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$")
 
@@ -48,37 +56,21 @@ class FailingLookupAirtableClient:
         raise AirtableError("boom")
 
 
-class FakeVapiClient:
-    """Mocked VapiClient.get_call: returns each entry in call_responses in
-    order (or raises it, if it's a VapiError), one per poll attempt."""
-
-    def __init__(self, call_responses: list[dict[str, Any] | Exception] | None = None) -> None:
-        self._call_responses = list(call_responses or [])
-        self.get_call_calls: list[str] = []
-
-    async def get_call(self, call_id: str) -> dict[str, Any]:
-        self.get_call_calls.append(call_id)
-        if not self._call_responses:
-            return {}
-        response = self._call_responses.pop(0)
-        if isinstance(response, Exception):
-            raise response
-        return response
-
-
 def _end_of_call_report(
     *,
     call_id: str = "call_999",
     ended_reason: str = "customer-ended-call",
     structured_outputs: dict | None = None,
     structured_data: dict | None = None,
+    transcript_turns: list[tuple[str, str]] | None = None,
     summary: str | None = "Passenger chose the alternative flight.",
     recording_url: str = "https://recordings.vapi.ai/call_999.mp3",
 ) -> dict:
+    call: dict = {"id": call_id}
     message: dict = {
         "type": "end-of-call-report",
         "endedReason": ended_reason,
-        "call": {"id": call_id},
+        "call": call,
         "summary": summary,
         "recordingUrl": recording_url,
     }
@@ -86,6 +78,10 @@ def _end_of_call_report(
         message["structuredOutputs"] = structured_outputs
     if structured_data is not None:
         message["analysis"] = {"structuredData": structured_data}
+    if transcript_turns is not None:
+        message["artifact"] = {
+            "messages": [{"role": role, "message": text} for role, text in transcript_turns]
+        }
     return {"message": message}
 
 
@@ -119,6 +115,30 @@ def _structured_data(*, decision: str | None = None, summary: str | None = None)
     if summary is not None:
         data["9c858901-8a57-4791-81fe-4c455b099bc9"] = {"name": "summary", "result": summary}
     return data
+
+
+def _transcript_message(
+    turns: list[tuple[str, str]], call: VapiCall | None = None
+) -> VapiMessage:
+    """Build a VapiMessage with message.artifact.messages populated from an
+    ordered list of (role, text) turns, e.g. [("assistant", "..."), ("user", "...")]."""
+    return VapiMessage(
+        artifact=VapiArtifact(
+            messages=[VapiArtifactMessage(role=role, message=text) for role, text in turns]
+        ),
+        call=call,
+    )
+
+
+def _fallback_summary(name: str | None = None, flight: str | None = None) -> str:
+    """Expected deterministic fallback summary for an undecided outcome
+    with no transcript signal, matching _extract_summary_from_transcript's
+    template exactly (kept independent of the implementation on purpose, so
+    a regression in the template shows up here rather than only visually)."""
+    subject = f"הנוסע {name}" if name else "הנוסע"
+    flight_clause = f" בטיסה {flight}" if flight else ""
+    label = _DECISION_HEBREW_LABELS[PassengerDecision.undecided.value]
+    return f"{subject} התבקש לבחור בין טיסה חלופית להחזר כספי בעקבות עיכוב{flight_clause}, ובחר ב{label}."
 
 
 def test_webhook_wrong_secret_returns_401(client: TestClient) -> None:
@@ -243,20 +263,6 @@ def test_webhook_error_reason_maps_to_failed(client: TestClient) -> None:
     assert fake_airtable.updates[0][1]["call_status"] == "failed"
 
 
-def test_webhook_missing_structured_outputs_defaults_to_undecided(client: TestClient) -> None:
-    fake_airtable = FakeAirtableClient(SAMPLE_RECORD)
-    app.dependency_overrides[get_airtable_client] = lambda: fake_airtable
-
-    response = client.post(
-        "/webhooks/vapi",
-        json=_end_of_call_report(structured_outputs=None),
-        headers={"x-vapi-secret": "secret"},
-    )
-
-    assert response.status_code == 200
-    assert fake_airtable.updates[0][1]["passenger_decision"] == "undecided"
-
-
 def test_webhook_recognizes_callback_requested_decision(client: TestClient) -> None:
     fake_airtable = FakeAirtableClient(SAMPLE_RECORD)
     app.dependency_overrides[get_airtable_client] = lambda: fake_airtable
@@ -271,6 +277,30 @@ def test_webhook_recognizes_callback_requested_decision(client: TestClient) -> N
 
     assert response.status_code == 200
     assert fake_airtable.updates[0][1]["passenger_decision"] == "callback_requested"
+
+
+def test_webhook_unrecognized_structured_decision_falls_back_to_transcript(
+    client: TestClient,
+) -> None:
+    """An invalid/unrecognized structuredOutputs decision must not block
+    the transcript fallback — it should be treated the same as absent."""
+    fake_airtable = FakeAirtableClient(SAMPLE_RECORD)
+    app.dependency_overrides[get_airtable_client] = lambda: fake_airtable
+
+    response = client.post(
+        "/webhooks/vapi",
+        json=_end_of_call_report(
+            structured_outputs=_structured_outputs(decision="not_a_real_choice"),
+            transcript_turns=[("user", "אני רוצה לדבר עם נציג בבקשה")],
+        ),
+        headers={"x-vapi-secret": "secret"},
+    )
+
+    assert response.status_code == 200
+    assert fake_airtable.updates[0][1]["passenger_decision"] == "human_agent"
+
+
+# --- _find_structured_result -------------------------------------------------
 
 
 def test_find_structured_result_matches_uuid_keyed_entry() -> None:
@@ -313,6 +343,9 @@ def test_find_structured_result_ignores_malformed_entries() -> None:
         "non-string-result": {"name": "decision", "result": 42},
     }
     assert _find_structured_result(structured, "decision") is None
+
+
+# --- _extract_decision (structuredOutputs-based bonus override) -------------
 
 
 def test_extract_decision_from_uuid_keyed_structured_outputs() -> None:
@@ -358,9 +391,9 @@ def test_extract_decision_defaults_to_undecided_when_structured_outputs_empty() 
 
 
 def test_extract_decision_ignores_legacy_analysis_structured_data() -> None:
-    """The old analysis.structuredData path is no longer read — decisions
-    must come from message.structuredOutputs instead. analysis is empty in
-    production because analysisPlan.summaryPlan is disabled."""
+    """The old analysis.structuredData path is not read by _extract_decision
+    — decisions come from message.structuredOutputs instead. analysis is
+    empty in production because analysisPlan.summaryPlan is disabled."""
     message = VapiMessage(
         analysis=VapiAnalysis(
             structuredData={
@@ -371,15 +404,176 @@ def test_extract_decision_ignores_legacy_analysis_structured_data() -> None:
     assert _extract_decision(message) == PassengerDecision.undecided.value
 
 
-def test_webhook_extracts_decision_from_uuid_keyed_structured_outputs(
-    client: TestClient,
-) -> None:
+# --- _extract_decision_from_transcript ---------------------------------------
+
+
+def test_extract_decision_from_transcript_alternative_flight() -> None:
+    for text in [
+        "אני חושב שאני רוצה את הטיסה החלופית",
+        "החלופית מתאימה לי הכי טוב",
+        "אני מעדיף טיסה אחרת בבקשה",
+    ]:
+        message = _transcript_message([("user", text)])
+        assert _extract_decision_from_transcript(message) == "alternative_flight"
+
+
+def test_extract_decision_from_transcript_refund() -> None:
+    for text in [
+        "אני מעדיף לקבל החזר כספי בבקשה",
+        "פשוט תעשו לי החזר",
+        "אני רוצה את הכסף בחזרה",
+        "אני בהחלט רוצה את הכסף",
+    ]:
+        message = _transcript_message([("user", text)])
+        assert _extract_decision_from_transcript(message) == "refund"
+
+
+def test_extract_decision_from_transcript_human_agent() -> None:
+    for text in [
+        "אני רוצה לדבר עם נציג בבקשה",
+        "אפשר להעביר אותי לאדם אמיתי?",
+        "אני צריך לדבר עם מישהו על זה",
+    ]:
+        message = _transcript_message([("user", text)])
+        assert _extract_decision_from_transcript(message) == "human_agent"
+
+
+def test_extract_decision_from_transcript_callback_requested() -> None:
+    for text in [
+        "אני צריך לחשוב על זה עוד קצת",
+        "תתקשרו אליי אחר כך בבקשה",
+        "אין לי זמן כרגע",
+        "לא כרגע, אולי מחר",
+    ]:
+        message = _transcript_message([("user", text)])
+        assert _extract_decision_from_transcript(message) == "callback_requested"
+
+
+def test_extract_decision_from_transcript_undecided_when_no_phrase_matches() -> None:
+    message = _transcript_message([("assistant", "איך אפשר לעזור?"), ("user", "שלום, מה שלומך?")])
+    assert _extract_decision_from_transcript(message) == PassengerDecision.undecided.value
+
+
+def test_extract_decision_from_transcript_undecided_when_artifact_missing() -> None:
+    assert _extract_decision_from_transcript(VapiMessage()) == PassengerDecision.undecided.value
+
+
+def test_extract_decision_from_transcript_undecided_when_messages_empty() -> None:
+    message = _transcript_message([])
+    assert _extract_decision_from_transcript(message) == PassengerDecision.undecided.value
+
+
+def test_extract_decision_from_transcript_undecided_when_only_assistant_turns() -> None:
+    message = _transcript_message([("assistant", "אני יכול להציע לך טיסה חלופית או החזר כספי")])
+    assert _extract_decision_from_transcript(message) == PassengerDecision.undecided.value
+
+
+def test_extract_decision_from_transcript_later_signal_wins_refund_then_alternative() -> None:
+    """Passenger asks about a refund first, then settles on the alternative
+    flight — the later, more recent statement should win even though its
+    category comes earlier in the phrase dict than "refund"."""
+    message = _transcript_message(
+        [
+            ("user", "בהתחלה חשבתי שאני רוצה החזר כספי"),
+            ("assistant", "בסדר, ומה לגבי הטיסה החלופית?"),
+            ("user", "אבל בסוף אני רוצה את הטיסה החלופית"),
+        ]
+    )
+    assert _extract_decision_from_transcript(message) == "alternative_flight"
+
+
+def test_extract_decision_from_transcript_later_signal_wins_alternative_then_refund() -> None:
+    """Same scenario reversed, to confirm it's genuinely position-based and
+    not just picking whichever category happens to be declared first."""
+    message = _transcript_message(
+        [
+            ("user", "טיסה חלופית זה מעניין"),
+            ("user", "אבל בסוף אני רוצה את הכסף בחזרה"),
+        ]
+    )
+    assert _extract_decision_from_transcript(message) == "refund"
+
+
+def test_extract_decision_from_transcript_handles_punctuation_variations() -> None:
+    message = _transcript_message([("user", 'אני, למעשה, רוצה "טיסה חלופית".')])
+    assert _extract_decision_from_transcript(message) == "alternative_flight"
+
+
+def test_extract_decision_from_transcript_case_insensitive_for_latin_text() -> None:
+    message = _transcript_message([("user", "OK, אני רוצה את הכסף בחזרה")])
+    assert _extract_decision_from_transcript(message) == "refund"
+
+
+# --- _extract_summary_from_transcript ----------------------------------------
+
+
+def test_extract_summary_from_transcript_includes_name_flight_and_decision() -> None:
+    call = VapiCall(
+        assistantOverrides={
+            "variableValues": {"passenger_name": "יוסי כהן", "flight_number": "LY315"}
+        }
+    )
+    message = _transcript_message([("user", "אני רוצה החזר כספי")], call=call)
+
+    summary = _extract_summary_from_transcript(message)
+
+    assert summary.startswith("הנוסע יוסי כהן")
+    assert "LY315" in summary
+    assert summary.endswith("ובחר בהחזר כספי.")
+
+
+def test_extract_summary_from_transcript_falls_back_to_generic_phrasing_when_no_context() -> None:
+    summary = _extract_summary_from_transcript(_transcript_message([]))
+    assert summary == _fallback_summary()
+    assert "הנוסע הנוסע" not in summary
+
+
+def test_extract_summary_from_transcript_reflects_undecided_when_no_signal() -> None:
+    summary = _extract_summary_from_transcript(_transcript_message([("user", "שלום")]))
+    assert summary.endswith(f"ובחר ב{_DECISION_HEBREW_LABELS['undecided']}.")
+
+
+# --- webhook-level: transcript is now the reliable primary path -------------
+
+
+def test_webhook_extracts_decision_and_summary_from_transcript(client: TestClient) -> None:
     fake_airtable = FakeAirtableClient(SAMPLE_RECORD)
     app.dependency_overrides[get_airtable_client] = lambda: fake_airtable
 
     response = client.post(
         "/webhooks/vapi",
-        json=_end_of_call_report(structured_outputs=_structured_outputs(decision="human_agent")),
+        json=_end_of_call_report(
+            summary=None,
+            transcript_turns=[
+                ("assistant", "האם תרצה טיסה חלופית או החזר כספי?"),
+                ("user", "אני מעדיף לקבל החזר כספי בבקשה"),
+            ],
+        ),
+        headers={"x-vapi-secret": "secret"},
+    )
+
+    assert response.status_code == 200
+    fields = fake_airtable.updates[0][1]
+    assert fields["passenger_decision"] == "refund"
+    assert fields["call_summary"].endswith("ובחר בהחזר כספי.")
+
+
+def test_webhook_structured_outputs_bonus_override_wins_over_conflicting_transcript(
+    client: TestClient,
+) -> None:
+    """When structuredOutputs is present and valid, it takes priority over
+    transcript analysis — even if the transcript would classify
+    differently."""
+    fake_airtable = FakeAirtableClient(SAMPLE_RECORD)
+    app.dependency_overrides[get_airtable_client] = lambda: fake_airtable
+
+    response = client.post(
+        "/webhooks/vapi",
+        json=_end_of_call_report(
+            summary=None,
+            structured_outputs=_structured_outputs(decision="human_agent"),
+            transcript_turns=[("user", "אני מעדיף לקבל החזר כספי בבקשה")],
+        ),
         headers={"x-vapi-secret": "secret"},
     )
 
@@ -387,7 +581,7 @@ def test_webhook_extracts_decision_from_uuid_keyed_structured_outputs(
     assert fake_airtable.updates[0][1]["passenger_decision"] == "human_agent"
 
 
-def test_webhook_extracts_summary_from_uuid_keyed_structured_outputs(
+def test_webhook_structured_outputs_summary_bonus_override_wins_over_transcript(
     client: TestClient,
 ) -> None:
     fake_airtable = FakeAirtableClient(SAMPLE_RECORD)
@@ -397,56 +591,62 @@ def test_webhook_extracts_summary_from_uuid_keyed_structured_outputs(
         "/webhooks/vapi",
         json=_end_of_call_report(
             summary=None,
-            structured_outputs=_structured_outputs(summary="Passenger wants a callback."),
+            structured_outputs=_structured_outputs(summary="Structured summary wins."),
+            transcript_turns=[("user", "אני מעדיף לקבל החזר כספי בבקשה")],
         ),
         headers={"x-vapi-secret": "secret"},
     )
 
     assert response.status_code == 200
-    assert fake_airtable.updates[0][1]["call_summary"] == "Passenger wants a callback."
+    assert fake_airtable.updates[0][1]["call_summary"] == "Structured summary wins."
 
 
-def test_webhook_summary_falls_back_to_top_level_when_no_structured_summary(
+def test_webhook_missing_structured_outputs_and_transcript_falls_back_to_deterministic_summary(
     client: TestClient,
 ) -> None:
+    """No structuredOutputs, no transcript: decision stays undecided, and
+    call_summary is now the deterministic template sentence rather than an
+    empty string."""
     fake_airtable = FakeAirtableClient(SAMPLE_RECORD)
     app.dependency_overrides[get_airtable_client] = lambda: fake_airtable
 
     response = client.post(
         "/webhooks/vapi",
-        json=_end_of_call_report(
-            summary="Top-level summary.",
-            structured_outputs=_structured_outputs(decision="refund"),
-        ),
-        headers={"x-vapi-secret": "secret"},
-    )
-
-    assert response.status_code == 200
-    assert fake_airtable.updates[0][1]["call_summary"] == "Top-level summary."
-
-
-def test_webhook_empty_structured_outputs_defaults_to_undecided_and_empty_summary(
-    client: TestClient,
-) -> None:
-    fake_airtable = FakeAirtableClient(SAMPLE_RECORD)
-    app.dependency_overrides[get_airtable_client] = lambda: fake_airtable
-
-    response = client.post(
-        "/webhooks/vapi",
-        json=_end_of_call_report(summary=None, structured_outputs={}),
+        json=_end_of_call_report(summary=None, structured_outputs=None),
         headers={"x-vapi-secret": "secret"},
     )
 
     assert response.status_code == 200
     fields = fake_airtable.updates[0][1]
     assert fields["passenger_decision"] == "undecided"
-    assert fields["call_summary"] == ""
+    assert fields["call_summary"] == _fallback_summary()
+
+
+def test_webhook_empty_structured_outputs_falls_back_to_transcript(client: TestClient) -> None:
+    fake_airtable = FakeAirtableClient(SAMPLE_RECORD)
+    app.dependency_overrides[get_airtable_client] = lambda: fake_airtable
+
+    response = client.post(
+        "/webhooks/vapi",
+        json=_end_of_call_report(
+            summary=None,
+            structured_outputs={},
+            transcript_turns=[("user", "אני רוצה לדבר עם נציג בבקשה")],
+        ),
+        headers={"x-vapi-secret": "secret"},
+    )
+
+    assert response.status_code == 200
+    fields = fake_airtable.updates[0][1]
+    assert fields["passenger_decision"] == "human_agent"
 
 
 def test_webhook_legacy_analysis_structured_data_no_longer_used(client: TestClient) -> None:
-    """Confirms the old analysis.structuredData path is no longer required:
-    a payload that only populates it (no structuredOutputs) must not
-    extract a decision or summary from it."""
+    """Confirms the old analysis.structuredData path is still not read: a
+    payload that only populates it (no structuredOutputs, no transcript)
+    must not extract a decision or summary from it — it falls through to
+    the deterministic transcript-fallback summary, same as if it were
+    entirely absent."""
     fake_airtable = FakeAirtableClient(SAMPLE_RECORD)
     app.dependency_overrides[get_airtable_client] = lambda: fake_airtable
 
@@ -462,81 +662,26 @@ def test_webhook_legacy_analysis_structured_data_no_longer_used(client: TestClie
     assert response.status_code == 200
     fields = fake_airtable.updates[0][1]
     assert fields["passenger_decision"] == "undecided"
-    assert fields["call_summary"] == ""
+    assert fields["call_summary"] == _fallback_summary()
 
 
-def test_webhook_polls_vapi_and_recovers_structured_outputs_on_second_attempt(
-    client: TestClient,
-) -> None:
-    """structuredOutputs is absent from the webhook payload itself (Vapi
-    computes it asynchronously and never re-notifies), so the handler must
-    poll GET /call/{id}. Here the first poll comes back empty and the
-    second one has it."""
+def test_webhook_unrecognized_decision_defaults_to_undecided(client: TestClient) -> None:
     fake_airtable = FakeAirtableClient(SAMPLE_RECORD)
-    fake_vapi = FakeVapiClient(
-        call_responses=[
-            {"id": "call_999", "structuredOutputs": None},
-            {
-                "id": "call_999",
-                "structuredOutputs": _structured_outputs(
-                    decision="refund", summary="Passenger wants a refund."
-                ),
-            },
-        ]
-    )
     app.dependency_overrides[get_airtable_client] = lambda: fake_airtable
-    app.dependency_overrides[get_vapi_client] = lambda: fake_vapi
-
-    response = client.post(
-        "/webhooks/vapi",
-        json=_end_of_call_report(summary=None, structured_outputs=None),
-        headers={"x-vapi-secret": "secret"},
-    )
-
-    assert response.status_code == 200
-    assert len(fake_vapi.get_call_calls) == 2
-    assert fake_vapi.get_call_calls == ["call_999", "call_999"]
-    fields = fake_airtable.updates[0][1]
-    assert fields["passenger_decision"] == "refund"
-    assert fields["call_summary"] == "Passenger wants a refund."
-
-
-def test_webhook_falls_back_to_undecided_when_poll_exhausted(client: TestClient) -> None:
-    """All 5 poll attempts come back empty (or fail) — the handler must
-    still update call_status/timestamp/recording_url from the original
-    webhook payload, leaving decision as undecided rather than giving up."""
-    fake_airtable = FakeAirtableClient(SAMPLE_RECORD)
-    fake_vapi = FakeVapiClient(
-        call_responses=[
-            {"id": "call_999", "structuredOutputs": {}},
-            VapiError("Vapi is unavailable"),
-            {"id": "call_999", "structuredOutputs": None},
-            {"id": "call_999", "structuredOutputs": {}},
-            {"id": "call_999", "structuredOutputs": None},
-        ]
-    )
-    app.dependency_overrides[get_airtable_client] = lambda: fake_airtable
-    app.dependency_overrides[get_vapi_client] = lambda: fake_vapi
 
     response = client.post(
         "/webhooks/vapi",
         json=_end_of_call_report(
-            summary=None,
-            structured_outputs=None,
-            ended_reason="customer-ended-call",
-            recording_url="https://recordings.vapi.ai/call_999.mp3",
+            structured_outputs=_structured_outputs(decision="not_a_real_choice")
         ),
         headers={"x-vapi-secret": "secret"},
     )
 
     assert response.status_code == 200
-    assert len(fake_vapi.get_call_calls) == 5
-    fields = fake_airtable.updates[0][1]
-    assert fields["passenger_decision"] == "undecided"
-    assert fields["call_summary"] == ""
-    assert fields["call_status"] == "completed"
-    assert fields["recording_url"] == "https://recordings.vapi.ai/call_999.mp3"
-    assert "call_timestamp" in fields
+    assert fake_airtable.updates[0][1]["passenger_decision"] == "undecided"
+
+
+# --- _extract_call_timestamp (unaffected by this change) --------------------
 
 
 def test_extract_call_timestamp_prefers_top_level_ended_at() -> None:
@@ -586,19 +731,3 @@ def test_webhook_writes_iso8601_utc_call_timestamp_from_call_ended_at(
 
     assert response.status_code == 200
     assert fake_airtable.updates[0][1]["call_timestamp"] == "2026-08-17T12:03:00.000Z"
-
-
-def test_webhook_unrecognized_decision_defaults_to_undecided(client: TestClient) -> None:
-    fake_airtable = FakeAirtableClient(SAMPLE_RECORD)
-    app.dependency_overrides[get_airtable_client] = lambda: fake_airtable
-
-    response = client.post(
-        "/webhooks/vapi",
-        json=_end_of_call_report(
-            structured_outputs=_structured_outputs(decision="not_a_real_choice")
-        ),
-        headers={"x-vapi-secret": "secret"},
-    )
-
-    assert response.status_code == 200
-    assert fake_airtable.updates[0][1]["passenger_decision"] == "undecided"
