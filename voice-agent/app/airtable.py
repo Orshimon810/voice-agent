@@ -6,6 +6,7 @@ from typing import Any
 import httpx
 
 from app.config import Settings
+from app.logging_config import log_event
 from app.models import PassengerRecord
 from app.retry import retry_transient
 
@@ -65,7 +66,7 @@ class AirtableClient:
         try:
             return await self._request(method, url, **kwargs)
         except (httpx.TransportError, httpx.HTTPStatusError) as exc:
-            logger.error("airtable_request_failed", extra={"method": method, "url": url})
+            log_event(logger, logging.ERROR, "airtable_request_failed", method=method, url=url)
             raise AirtableError("Airtable is unavailable") from exc
 
     async def get_record(self, record_id: str) -> PassengerRecord | None:
@@ -73,7 +74,7 @@ class AirtableClient:
         if response.status_code == 404:
             return None
         if response.status_code >= 400:
-            logger.error("airtable_error", extra={"status_code": response.status_code})
+            log_event(logger, logging.ERROR, "airtable_error", status_code=response.status_code)
             raise AirtableError(f"Airtable request failed with status {response.status_code}")
         return parse_passenger_record(response.json())
 
@@ -84,7 +85,7 @@ class AirtableClient:
             "GET", self._base_url, params={"filterByFormula": formula, "maxRecords": 1}
         )
         if response.status_code >= 400:
-            logger.error("airtable_error", extra={"status_code": response.status_code})
+            log_event(logger, logging.ERROR, "airtable_error", status_code=response.status_code)
             raise AirtableError(f"Airtable request failed with status {response.status_code}")
 
         records = response.json().get("records", [])
@@ -95,5 +96,5 @@ class AirtableClient:
             "PATCH", f"{self._base_url}/{record_id}", json={"fields": fields}
         )
         if response.status_code >= 400:
-            logger.error("airtable_error", extra={"status_code": response.status_code})
+            log_event(logger, logging.ERROR, "airtable_error", status_code=response.status_code)
             raise AirtableError(f"Airtable request failed with status {response.status_code}")
