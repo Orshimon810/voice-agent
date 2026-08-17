@@ -3,8 +3,11 @@ from __future__ import annotations
 import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
+from typing import Any
 
-from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi import Depends, FastAPI, Header, HTTPException, Request
+from pydantic import ValidationError
 
 from app.airtable import AirtableClient, AirtableError
 from app.config import Settings, get_settings
@@ -15,13 +18,40 @@ from app.models import (
     CallTriggerResponse,
     HealthResponse,
     NormalizedFields,
+    PassengerDecision,
     PassengerRecord,
     PassengerResponse,
+    VapiMessage,
+    VapiWebhookPayload,
 )
 from app.vapi import VapiClient, VapiError
 
 configure_logging()
 logger = logging.getLogger(__name__)
+
+_VALID_DECISIONS = {member.value for member in PassengerDecision}
+
+
+def _extract_decision(message: VapiMessage) -> str:
+    structured = message.analysis.structuredData if message.analysis else None
+    if not structured:
+        return PassengerDecision.undecided.value
+
+    decision = structured.get("decision") or structured.get("passenger_decision")
+    if isinstance(decision, str) and decision in _VALID_DECISIONS:
+        return decision
+    return PassengerDecision.undecided.value
+
+
+def _map_ended_reason(ended_reason: str | None) -> str:
+    if not ended_reason:
+        return "completed"
+    reason = ended_reason.lower()
+    if "voicemail" in reason or "no-answer" in reason or "no_answer" in reason or "busy" in reason:
+        return "no_answer"
+    if "error" in reason or "failed" in reason:
+        return "failed"
+    return "completed"
 
 
 @asynccontextmanager
@@ -145,3 +175,60 @@ async def trigger_call(
         call_id=call_id,
     )
     return CallTriggerResponse(call_id=call_id, variable_values=variable_values)
+
+
+@app.post("/webhooks/vapi")
+async def vapi_webhook(
+    request: Request,
+    airtable_client: AirtableClient = Depends(get_airtable_client),
+    settings: Settings = Depends(get_settings),
+    x_vapi_secret: str | None = Header(default=None),
+) -> dict[str, str]:
+    if x_vapi_secret != settings.webhook_secret:
+        raise HTTPException(status_code=401, detail="invalid webhook secret")
+
+    try:
+        raw_body: Any = await request.json()
+        payload = VapiWebhookPayload.model_validate(raw_body)
+    except (ValueError, ValidationError):
+        # Malformed JSON or an unexpected shape. Never let Vapi see a 5xx (or
+        # a validation 4xx) here — that would trigger retries and duplicate
+        # writes once the underlying issue is fixed.
+        log_event(logger, logging.WARNING, "webhook_malformed_payload")
+        return {"status": "ignored"}
+
+    message = payload.message
+    if message is None or message.type != "end-of-call-report":
+        return {"status": "ignored"}
+
+    call_id = message.call.id if message.call else None
+    if not call_id:
+        log_event(logger, logging.WARNING, "webhook_missing_call_id")
+        return {"status": "ignored"}
+
+    try:
+        record = await airtable_client.find_record_by_call_id(call_id)
+    except AirtableError:
+        log_event(logger, logging.ERROR, "webhook_airtable_lookup_failed", call_id=call_id)
+        return {"status": "error"}
+
+    if record is None:
+        log_event(logger, logging.WARNING, "webhook_record_not_found", call_id=call_id)
+        return {"status": "ignored"}
+
+    summary = message.summary or (message.analysis.summary if message.analysis else None) or ""
+    fields = {
+        "call_status": _map_ended_reason(message.endedReason),
+        "passenger_decision": _extract_decision(message),
+        "call_summary": summary,
+        "call_timestamp": datetime.now(timezone.utc).isoformat(),
+        "recording_url": message.recordingUrl or "",
+    }
+
+    try:
+        await airtable_client.update_record(record.record_id, fields)
+    except AirtableError:
+        log_event(logger, logging.ERROR, "webhook_airtable_update_failed", call_id=call_id)
+        return {"status": "error"}
+
+    return {"status": "ok"}
