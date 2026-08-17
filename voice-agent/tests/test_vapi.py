@@ -96,3 +96,30 @@ async def test_create_call_persistent_server_error_raises(settings: Settings) ->
                     customer_number="+972501234567",
                     variable_values={},
                 )
+
+
+@pytest.mark.asyncio
+async def test_get_call_success(settings: Settings) -> None:
+    async with httpx.AsyncClient() as http_client:
+        client = VapiClient(settings, client=http_client)
+        with respx.mock:
+            route = respx.get("https://api.vapi.ai/call/call_123").mock(
+                return_value=httpx.Response(
+                    200, json={"id": "call_123", "structuredOutputs": {"uuid": {"name": "decision"}}}
+                )
+            )
+            result = await client.get_call("call_123")
+
+    assert result == {"id": "call_123", "structuredOutputs": {"uuid": {"name": "decision"}}}
+    request = route.calls.last.request
+    assert request.headers["Authorization"] == "Bearer vapi-secret-key"
+
+
+@pytest.mark.asyncio
+async def test_get_call_client_error_raises(settings: Settings) -> None:
+    async with httpx.AsyncClient() as http_client:
+        client = VapiClient(settings, client=http_client)
+        with respx.mock:
+            respx.get("https://api.vapi.ai/call/call_123").mock(return_value=httpx.Response(404))
+            with pytest.raises(VapiError):
+                await client.get_call("call_123")

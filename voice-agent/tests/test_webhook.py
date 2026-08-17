@@ -1,4 +1,5 @@
 import re
+from typing import Any
 
 from fastapi.testclient import TestClient
 
@@ -9,8 +10,10 @@ from app.main import (
     _find_structured_result,
     app,
     get_airtable_client,
+    get_vapi_client,
 )
 from app.models import PassengerDecision, PassengerRecord, VapiAnalysis, VapiCall, VapiMessage
+from app.vapi import VapiError
 
 _ISO8601_UTC_MS = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$")
 
@@ -43,6 +46,24 @@ class FakeAirtableClient:
 class FailingLookupAirtableClient:
     async def find_record_by_call_id(self, call_id: str) -> PassengerRecord | None:
         raise AirtableError("boom")
+
+
+class FakeVapiClient:
+    """Mocked VapiClient.get_call: returns each entry in call_responses in
+    order (or raises it, if it's a VapiError), one per poll attempt."""
+
+    def __init__(self, call_responses: list[dict[str, Any] | Exception] | None = None) -> None:
+        self._call_responses = list(call_responses or [])
+        self.get_call_calls: list[str] = []
+
+    async def get_call(self, call_id: str) -> dict[str, Any]:
+        self.get_call_calls.append(call_id)
+        if not self._call_responses:
+            return {}
+        response = self._call_responses.pop(0)
+        if isinstance(response, Exception):
+            raise response
+        return response
 
 
 def _end_of_call_report(
@@ -442,6 +463,78 @@ def test_webhook_legacy_analysis_structured_data_no_longer_used(client: TestClie
     fields = fake_airtable.updates[0][1]
     assert fields["passenger_decision"] == "undecided"
     assert fields["call_summary"] == ""
+
+
+def test_webhook_polls_vapi_and_recovers_structured_outputs_on_second_attempt(
+    client: TestClient,
+) -> None:
+    """structuredOutputs is absent from the webhook payload itself (Vapi
+    computes it asynchronously and never re-notifies), so the handler must
+    poll GET /call/{id}. Here the first poll comes back empty and the
+    second one has it."""
+    fake_airtable = FakeAirtableClient(SAMPLE_RECORD)
+    fake_vapi = FakeVapiClient(
+        call_responses=[
+            {"id": "call_999", "structuredOutputs": None},
+            {
+                "id": "call_999",
+                "structuredOutputs": _structured_outputs(
+                    decision="refund", summary="Passenger wants a refund."
+                ),
+            },
+        ]
+    )
+    app.dependency_overrides[get_airtable_client] = lambda: fake_airtable
+    app.dependency_overrides[get_vapi_client] = lambda: fake_vapi
+
+    response = client.post(
+        "/webhooks/vapi",
+        json=_end_of_call_report(summary=None, structured_outputs=None),
+        headers={"x-vapi-secret": "secret"},
+    )
+
+    assert response.status_code == 200
+    assert len(fake_vapi.get_call_calls) == 2
+    assert fake_vapi.get_call_calls == ["call_999", "call_999"]
+    fields = fake_airtable.updates[0][1]
+    assert fields["passenger_decision"] == "refund"
+    assert fields["call_summary"] == "Passenger wants a refund."
+
+
+def test_webhook_falls_back_to_undecided_when_poll_exhausted(client: TestClient) -> None:
+    """All 3 poll attempts come back empty (or fail) — the handler must
+    still update call_status/timestamp/recording_url from the original
+    webhook payload, leaving decision as undecided rather than giving up."""
+    fake_airtable = FakeAirtableClient(SAMPLE_RECORD)
+    fake_vapi = FakeVapiClient(
+        call_responses=[
+            {"id": "call_999", "structuredOutputs": {}},
+            VapiError("Vapi is unavailable"),
+            {"id": "call_999", "structuredOutputs": None},
+        ]
+    )
+    app.dependency_overrides[get_airtable_client] = lambda: fake_airtable
+    app.dependency_overrides[get_vapi_client] = lambda: fake_vapi
+
+    response = client.post(
+        "/webhooks/vapi",
+        json=_end_of_call_report(
+            summary=None,
+            structured_outputs=None,
+            ended_reason="customer-ended-call",
+            recording_url="https://recordings.vapi.ai/call_999.mp3",
+        ),
+        headers={"x-vapi-secret": "secret"},
+    )
+
+    assert response.status_code == 200
+    assert len(fake_vapi.get_call_calls) == 3
+    fields = fake_airtable.updates[0][1]
+    assert fields["passenger_decision"] == "undecided"
+    assert fields["call_summary"] == ""
+    assert fields["call_status"] == "completed"
+    assert fields["recording_url"] == "https://recordings.vapi.ai/call_999.mp3"
+    assert "call_timestamp" in fields
 
 
 def test_extract_call_timestamp_prefers_top_level_ended_at() -> None:

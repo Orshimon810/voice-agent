@@ -63,3 +63,16 @@ class VapiClient:
             raise VapiError(f"Vapi request failed with status {response.status_code}")
 
         return response.json()
+
+    async def get_call(self, call_id: str) -> dict[str, Any]:
+        try:
+            response = await self._request("GET", f"{_BASE_URL}/call/{call_id}")
+        except (httpx.TransportError, httpx.HTTPStatusError) as exc:
+            log_event(logger, logging.ERROR, "vapi_request_failed", url=f"/call/{call_id}")
+            raise VapiError("Vapi is unavailable") from exc
+
+        if response.status_code >= 400:
+            log_event(logger, logging.ERROR, "vapi_error", status_code=response.status_code)
+            raise VapiError(f"Vapi request failed with status {response.status_code}")
+
+        return response.json()
