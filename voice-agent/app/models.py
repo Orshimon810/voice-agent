@@ -79,11 +79,24 @@ class VapiCall(BaseModel):
     id: str | None = None
     startedAt: str | None = None
     endedAt: str | None = None
+    # Echoes back the variableValues passed at call-creation time (see
+    # app.main._build_variable_values) — the only place passenger
+    # name/flight context is available from within the webhook payload.
+    assistantOverrides: dict[str, Any] | None = None
 
 
 class VapiAnalysis(BaseModel):
     summary: str | None = None
     structuredData: dict[str, Any] | None = None
+
+
+class VapiArtifactMessage(BaseModel):
+    role: str | None = None
+    message: str | None = None
+
+
+class VapiArtifact(BaseModel):
+    messages: list[VapiArtifactMessage] | None = None
 
 
 class VapiMessage(BaseModel):
@@ -94,10 +107,13 @@ class VapiMessage(BaseModel):
     transcript: str | None = None
     recordingUrl: str | None = None
     analysis: VapiAnalysis | None = None
+    artifact: VapiArtifact | None = None
     startedAt: str | None = None
     endedAt: str | None = None
     # Top-level, sibling to "analysis" — not nested inside it. Random-UUID
     # keys, each value shaped like {"name": ..., "result": ..., "compliancePlan": ...}.
+    # Computed asynchronously by Vapi and often absent at webhook delivery
+    # time — see _extract_decision_from_transcript for the reliable path.
     structuredOutputs: dict[str, dict[str, Any]] | None = None
 
 
