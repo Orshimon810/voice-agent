@@ -49,25 +49,49 @@ def _end_of_call_report(
     *,
     call_id: str = "call_999",
     ended_reason: str = "customer-ended-call",
+    structured_outputs: dict | None = None,
     structured_data: dict | None = None,
     summary: str | None = "Passenger chose the alternative flight.",
     recording_url: str = "https://recordings.vapi.ai/call_999.mp3",
 ) -> dict:
-    return {
-        "message": {
-            "type": "end-of-call-report",
-            "endedReason": ended_reason,
-            "call": {"id": call_id},
-            "summary": summary,
-            "recordingUrl": recording_url,
-            "analysis": {"structuredData": structured_data} if structured_data is not None else None,
-        }
+    message: dict = {
+        "type": "end-of-call-report",
+        "endedReason": ended_reason,
+        "call": {"id": call_id},
+        "summary": summary,
+        "recordingUrl": recording_url,
     }
+    if structured_outputs is not None:
+        message["structuredOutputs"] = structured_outputs
+    if structured_data is not None:
+        message["analysis"] = {"structuredData": structured_data}
+    return {"message": message}
+
+
+def _structured_outputs(*, decision: str | None = None, summary: str | None = None) -> dict:
+    """Build Vapi's real structuredOutputs shape (captured from production):
+    random-UUID keys, each value a {"name", "result", "compliancePlan"}
+    object. This lives at message.structuredOutputs, a sibling of
+    "analysis" — not nested inside it."""
+    data: dict[str, dict] = {}
+    if decision is not None:
+        data["3fa85f64-5717-4562-b3fc-2c963f66afa6"] = {
+            "name": "decision",
+            "result": decision,
+            "compliancePlan": None,
+        }
+    if summary is not None:
+        data["9c858901-8a57-4791-81fe-4c455b099bc9"] = {
+            "name": "summary",
+            "result": summary,
+            "compliancePlan": None,
+        }
+    return data
 
 
 def _structured_data(*, decision: str | None = None, summary: str | None = None) -> dict:
-    """Build Vapi's real structuredData shape: random-UUID keys, each value a
-    {"name": ..., "result": ...} object."""
+    """Build the legacy (no longer read) analysis.structuredData shape, for
+    tests confirming that path is no longer required."""
     data: dict[str, dict] = {}
     if decision is not None:
         data["3fa85f64-5717-4562-b3fc-2c963f66afa6"] = {"name": "decision", "result": decision}
@@ -153,7 +177,7 @@ def test_webhook_success_writes_completed_status_and_decision(client: TestClient
         "/webhooks/vapi",
         json=_end_of_call_report(
             ended_reason="customer-ended-call",
-            structured_data=_structured_data(decision="alternative_flight"),
+            structured_outputs=_structured_outputs(decision="alternative_flight"),
         ),
         headers={"x-vapi-secret": "secret"},
     )
@@ -198,13 +222,13 @@ def test_webhook_error_reason_maps_to_failed(client: TestClient) -> None:
     assert fake_airtable.updates[0][1]["call_status"] == "failed"
 
 
-def test_webhook_missing_structured_data_defaults_to_undecided(client: TestClient) -> None:
+def test_webhook_missing_structured_outputs_defaults_to_undecided(client: TestClient) -> None:
     fake_airtable = FakeAirtableClient(SAMPLE_RECORD)
     app.dependency_overrides[get_airtable_client] = lambda: fake_airtable
 
     response = client.post(
         "/webhooks/vapi",
-        json=_end_of_call_report(structured_data=None),
+        json=_end_of_call_report(structured_outputs=None),
         headers={"x-vapi-secret": "secret"},
     )
 
@@ -218,7 +242,9 @@ def test_webhook_recognizes_callback_requested_decision(client: TestClient) -> N
 
     response = client.post(
         "/webhooks/vapi",
-        json=_end_of_call_report(structured_data=_structured_data(decision="callback_requested")),
+        json=_end_of_call_report(
+            structured_outputs=_structured_outputs(decision="callback_requested")
+        ),
         headers={"x-vapi-secret": "secret"},
     )
 
@@ -228,15 +254,29 @@ def test_webhook_recognizes_callback_requested_decision(client: TestClient) -> N
 
 def test_find_structured_result_matches_uuid_keyed_entry() -> None:
     structured = {
-        "3fa85f64-5717-4562-b3fc-2c963f66afa6": {"name": "decision", "result": "refund"},
-        "9c858901-8a57-4791-81fe-4c455b099bc9": {"name": "summary", "result": "some summary"},
+        "3fa85f64-5717-4562-b3fc-2c963f66afa6": {
+            "name": "decision",
+            "result": "refund",
+            "compliancePlan": None,
+        },
+        "9c858901-8a57-4791-81fe-4c455b099bc9": {
+            "name": "summary",
+            "result": "some summary",
+            "compliancePlan": None,
+        },
     }
     assert _find_structured_result(structured, "decision") == "refund"
     assert _find_structured_result(structured, "summary") == "some summary"
 
 
 def test_find_structured_result_returns_none_when_name_absent() -> None:
-    structured = {"3fa85f64-5717-4562-b3fc-2c963f66afa6": {"name": "decision", "result": "refund"}}
+    structured = {
+        "3fa85f64-5717-4562-b3fc-2c963f66afa6": {
+            "name": "decision",
+            "result": "refund",
+            "compliancePlan": None,
+        }
+    }
     assert _find_structured_result(structured, "summary") is None
 
 
@@ -254,51 +294,71 @@ def test_find_structured_result_ignores_malformed_entries() -> None:
     assert _find_structured_result(structured, "decision") is None
 
 
-def test_extract_decision_from_uuid_keyed_structured_data() -> None:
+def test_extract_decision_from_uuid_keyed_structured_outputs() -> None:
+    """Exact shape captured from production: structuredOutputs is a
+    top-level field on the message, sibling to "analysis"."""
     message = VapiMessage(
-        analysis=VapiAnalysis(
-            structuredData={
-                "3fa85f64-5717-4562-b3fc-2c963f66afa6": {"name": "decision", "result": "refund"},
-                "c3b2a1f0-1234-4abc-9def-0123456789ab": {
-                    "name": "some_other_field",
-                    "result": "irrelevant",
-                },
-            }
-        )
+        structuredOutputs={
+            "3fa85f64-5717-4562-b3fc-2c963f66afa6": {
+                "name": "decision",
+                "result": "refund",
+                "compliancePlan": None,
+            },
+            "c3b2a1f0-1234-4abc-9def-0123456789ab": {
+                "name": "some_other_field",
+                "result": "irrelevant",
+                "compliancePlan": None,
+            },
+        }
     )
     assert _extract_decision(message) == "refund"
 
 
 def test_extract_decision_defaults_to_undecided_for_unknown_result() -> None:
     message = VapiMessage(
+        structuredOutputs={
+            "3fa85f64-5717-4562-b3fc-2c963f66afa6": {
+                "name": "decision",
+                "result": "not_a_real_choice",
+                "compliancePlan": None,
+            }
+        }
+    )
+    assert _extract_decision(message) == PassengerDecision.undecided.value
+
+
+def test_extract_decision_defaults_to_undecided_when_structured_outputs_missing() -> None:
+    assert _extract_decision(VapiMessage()) == PassengerDecision.undecided.value
+
+
+def test_extract_decision_defaults_to_undecided_when_structured_outputs_empty() -> None:
+    message = VapiMessage(structuredOutputs={})
+    assert _extract_decision(message) == PassengerDecision.undecided.value
+
+
+def test_extract_decision_ignores_legacy_analysis_structured_data() -> None:
+    """The old analysis.structuredData path is no longer read — decisions
+    must come from message.structuredOutputs instead. analysis is empty in
+    production because analysisPlan.summaryPlan is disabled."""
+    message = VapiMessage(
         analysis=VapiAnalysis(
             structuredData={
-                "3fa85f64-5717-4562-b3fc-2c963f66afa6": {
-                    "name": "decision",
-                    "result": "not_a_real_choice",
-                }
+                "3fa85f64-5717-4562-b3fc-2c963f66afa6": {"name": "decision", "result": "refund"}
             }
         )
     )
     assert _extract_decision(message) == PassengerDecision.undecided.value
 
 
-def test_extract_decision_defaults_to_undecided_when_analysis_missing() -> None:
-    assert _extract_decision(VapiMessage()) == PassengerDecision.undecided.value
-
-
-def test_extract_decision_defaults_to_undecided_when_structured_data_empty() -> None:
-    message = VapiMessage(analysis=VapiAnalysis(structuredData={}))
-    assert _extract_decision(message) == PassengerDecision.undecided.value
-
-
-def test_webhook_extracts_decision_from_uuid_keyed_structured_data(client: TestClient) -> None:
+def test_webhook_extracts_decision_from_uuid_keyed_structured_outputs(
+    client: TestClient,
+) -> None:
     fake_airtable = FakeAirtableClient(SAMPLE_RECORD)
     app.dependency_overrides[get_airtable_client] = lambda: fake_airtable
 
     response = client.post(
         "/webhooks/vapi",
-        json=_end_of_call_report(structured_data=_structured_data(decision="human_agent")),
+        json=_end_of_call_report(structured_outputs=_structured_outputs(decision="human_agent")),
         headers={"x-vapi-secret": "secret"},
     )
 
@@ -306,7 +366,9 @@ def test_webhook_extracts_decision_from_uuid_keyed_structured_data(client: TestC
     assert fake_airtable.updates[0][1]["passenger_decision"] == "human_agent"
 
 
-def test_webhook_extracts_summary_from_uuid_keyed_structured_data(client: TestClient) -> None:
+def test_webhook_extracts_summary_from_uuid_keyed_structured_outputs(
+    client: TestClient,
+) -> None:
     fake_airtable = FakeAirtableClient(SAMPLE_RECORD)
     app.dependency_overrides[get_airtable_client] = lambda: fake_airtable
 
@@ -314,7 +376,7 @@ def test_webhook_extracts_summary_from_uuid_keyed_structured_data(client: TestCl
         "/webhooks/vapi",
         json=_end_of_call_report(
             summary=None,
-            structured_data=_structured_data(summary="Passenger wants a callback."),
+            structured_outputs=_structured_outputs(summary="Passenger wants a callback."),
         ),
         headers={"x-vapi-secret": "secret"},
     )
@@ -323,7 +385,7 @@ def test_webhook_extracts_summary_from_uuid_keyed_structured_data(client: TestCl
     assert fake_airtable.updates[0][1]["call_summary"] == "Passenger wants a callback."
 
 
-def test_webhook_empty_structured_data_defaults_to_undecided_and_empty_summary(
+def test_webhook_summary_falls_back_to_top_level_when_no_structured_summary(
     client: TestClient,
 ) -> None:
     fake_airtable = FakeAirtableClient(SAMPLE_RECORD)
@@ -331,7 +393,48 @@ def test_webhook_empty_structured_data_defaults_to_undecided_and_empty_summary(
 
     response = client.post(
         "/webhooks/vapi",
-        json=_end_of_call_report(summary=None, structured_data={}),
+        json=_end_of_call_report(
+            summary="Top-level summary.",
+            structured_outputs=_structured_outputs(decision="refund"),
+        ),
+        headers={"x-vapi-secret": "secret"},
+    )
+
+    assert response.status_code == 200
+    assert fake_airtable.updates[0][1]["call_summary"] == "Top-level summary."
+
+
+def test_webhook_empty_structured_outputs_defaults_to_undecided_and_empty_summary(
+    client: TestClient,
+) -> None:
+    fake_airtable = FakeAirtableClient(SAMPLE_RECORD)
+    app.dependency_overrides[get_airtable_client] = lambda: fake_airtable
+
+    response = client.post(
+        "/webhooks/vapi",
+        json=_end_of_call_report(summary=None, structured_outputs={}),
+        headers={"x-vapi-secret": "secret"},
+    )
+
+    assert response.status_code == 200
+    fields = fake_airtable.updates[0][1]
+    assert fields["passenger_decision"] == "undecided"
+    assert fields["call_summary"] == ""
+
+
+def test_webhook_legacy_analysis_structured_data_no_longer_used(client: TestClient) -> None:
+    """Confirms the old analysis.structuredData path is no longer required:
+    a payload that only populates it (no structuredOutputs) must not
+    extract a decision or summary from it."""
+    fake_airtable = FakeAirtableClient(SAMPLE_RECORD)
+    app.dependency_overrides[get_airtable_client] = lambda: fake_airtable
+
+    response = client.post(
+        "/webhooks/vapi",
+        json=_end_of_call_report(
+            summary=None,
+            structured_data=_structured_data(decision="refund", summary="old shape summary"),
+        ),
         headers={"x-vapi-secret": "secret"},
     )
 
@@ -396,7 +499,9 @@ def test_webhook_unrecognized_decision_defaults_to_undecided(client: TestClient)
 
     response = client.post(
         "/webhooks/vapi",
-        json=_end_of_call_report(structured_data=_structured_data(decision="not_a_real_choice")),
+        json=_end_of_call_report(
+            structured_outputs=_structured_outputs(decision="not_a_real_choice")
+        ),
         headers={"x-vapi-secret": "secret"},
     )
 

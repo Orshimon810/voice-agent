@@ -96,6 +96,9 @@ class VapiMessage(BaseModel):
     analysis: VapiAnalysis | None = None
     startedAt: str | None = None
     endedAt: str | None = None
+    # Top-level, sibling to "analysis" — not nested inside it. Random-UUID
+    # keys, each value shaped like {"name": ..., "result": ..., "compliancePlan": ...}.
+    structuredOutputs: dict[str, dict[str, Any]] | None = None
 
 
 class VapiWebhookPayload(BaseModel):
