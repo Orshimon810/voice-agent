@@ -67,8 +67,11 @@ def _extract_decision(message: VapiMessage) -> str:
 # transcripts are short/conversational enough that a curated phrase list
 # covers the realistic ways a passenger states each choice. Phrases are
 # matched as substrings against normalized (punctuation-stripped,
-# whitespace-collapsed) text, so they don't need to be whole-word/sentence
-# matches — "אני רוצה את הכסף בחזרה" still matches "רוצה את הכסף".
+# whitespace-collapsed, per-word definite-article-stripped — see
+# _normalize_hebrew_text) text, so they don't need to be whole-word/sentence
+# matches, and don't need every article variant spelled out separately —
+# "אני רוצה את הכסף בחזרה" still matches "רוצה את הכסף", and "הטיסה
+# החלופית" still matches "טיסה חלופית".
 _DECISION_PHRASES: dict[str, list[str]] = {
     PassengerDecision.alternative_flight.value: [
         "טיסה חלופית",
@@ -108,9 +111,23 @@ _DECISION_HEBREW_LABELS: dict[str, str] = {
 _PUNCTUATION_TRANSLATION = str.maketrans("", "", "\".,!?;:'׳״()־-")
 
 
+def _strip_leading_definite_article(word: str) -> str:
+    """Strip a leading Hebrew definite article ("ה-") from a single word,
+    e.g. "הטיסה" -> "טיסה", so "טיסה חלופית" and "הטיסה החלופית" normalize
+    to the same thing. Only strips when at least 2 characters remain
+    afterward, so short words where ה is part of the root rather than an
+    article (e.g. "הוא") mostly survive intact — a reasonable heuristic,
+    not a guarantee, consistent with the substring-matching approach here.
+    """
+    if word.startswith("ה") and len(word) - 1 >= 2:
+        return word[1:]
+    return word
+
+
 def _normalize_hebrew_text(text: str) -> str:
     stripped = text.translate(_PUNCTUATION_TRANSLATION).lower()
-    return " ".join(stripped.split())
+    words = (_strip_leading_definite_article(word) for word in stripped.split())
+    return " ".join(words)
 
 
 def _user_transcript_turns(message: VapiMessage) -> list[str]:
