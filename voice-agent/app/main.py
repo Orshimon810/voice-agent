@@ -33,12 +33,9 @@ _VALID_DECISIONS = {member.value for member in PassengerDecision}
 
 
 def _find_structured_result(structured: dict[str, Any] | None, name: str) -> str | None:
-    """Look up a value in one of Vapi's UUID-keyed structured field maps
-    (e.g. message.structuredOutputs).
-
-    Each entry is shaped like {"name": <field name>, "result": <value>, ...}
-    rather than the field name being the dict key directly.
-    """
+    """Look up a value in a UUID-keyed structured field map (e.g.
+    message.structuredOutputs), where each entry is shaped like
+    {"name": <field name>, "result": <value>, ...}."""
     if not structured:
         return None
     for entry in structured.values():
@@ -50,28 +47,19 @@ def _find_structured_result(structured: dict[str, Any] | None, name: str) -> str
 
 
 def _extract_decision(message: VapiMessage) -> str:
-    """structuredOutputs-based decision, when Vapi happens to have computed
-    it in time. Computed asynchronously and frequently absent at webhook
-    delivery time (even after polling GET /call/{id} for 15s in production)
-    — treat this as a bonus override, not the primary source. See
-    _extract_decision_from_transcript for the path that's actually reliable.
-    """
+    """Bonus-override decision from structuredOutputs, when Vapi computed
+    it in time. Often still missing at delivery — see
+    _extract_decision_from_transcript for the reliable path."""
     decision = _find_structured_result(message.structuredOutputs, "decision")
     if decision is not None and decision in _VALID_DECISIONS:
         return decision
     return PassengerDecision.undecided.value
 
 
-# Pragmatic substring-matching heuristic, not NLP: Hebrew has no lightweight,
-# dependency-free stemming library available here, and speech-to-text
-# transcripts are short/conversational enough that a curated phrase list
-# covers the realistic ways a passenger states each choice. Phrases are
-# matched as substrings against normalized (punctuation-stripped,
-# whitespace-collapsed, per-word definite-article-stripped — see
-# _normalize_hebrew_text) text, so they don't need to be whole-word/sentence
-# matches, and don't need every article variant spelled out separately —
-# "אני רוצה את הכסף בחזרה" still matches "רוצה את הכסף", and "הטיסה
-# החלופית" still matches "טיסה חלופית".
+# Substring-matching heuristic, not NLP — no lightweight Hebrew stemmer
+# available here. Both the transcript and each phrase go through
+# _normalize_hebrew_text first (punctuation stripped, article stripped),
+# so phrasing/article variants still match without listing every variant.
 _DECISION_PHRASES: dict[str, list[str]] = {
     PassengerDecision.alternative_flight.value: [
         "טיסה חלופית",
@@ -112,13 +100,9 @@ _PUNCTUATION_TRANSLATION = str.maketrans("", "", "\".,!?;:'׳״()־-")
 
 
 def _strip_leading_definite_article(word: str) -> str:
-    """Strip a leading Hebrew definite article ("ה-") from a single word,
-    e.g. "הטיסה" -> "טיסה", so "טיסה חלופית" and "הטיסה החלופית" normalize
-    to the same thing. Only strips when at least 2 characters remain
-    afterward, so short words where ה is part of the root rather than an
-    article (e.g. "הוא") mostly survive intact — a reasonable heuristic,
-    not a guarantee, consistent with the substring-matching approach here.
-    """
+    """Strip a leading Hebrew "ה" (definite article), e.g. "הטיסה" ->
+    "טיסה", so article and non-article phrasing match the same way. Skips
+    short words so roots like "הוא" mostly survive — not a guarantee."""
     if word.startswith("ה") and len(word) - 1 >= 2:
         return word[1:]
     return word
@@ -139,16 +123,11 @@ def _user_transcript_turns(message: VapiMessage) -> list[str]:
 
 
 def _extract_decision_from_transcript(message: VapiMessage) -> str:
-    """Classify the passenger's decision from what they actually said,
-    since the full transcript (message.artifact.messages) is reliably
-    present at webhook delivery time, unlike structuredOutputs.
+    """Classify the decision from what the passenger actually said — the
+    transcript is reliably present, unlike structuredOutputs.
 
-    Scans every candidate phrase across all categories and picks whichever
-    one's last occurrence sits latest in the (normalized) user transcript —
-    "most recent expressed intent wins" — so a passenger asking about an
-    option before ultimately choosing something else still resolves
-    correctly.
-    """
+    If multiple categories match, the one appearing latest in the
+    conversation wins (most recent intent)."""
     user_turns = _user_transcript_turns(message)
     if not user_turns:
         return PassengerDecision.undecided.value
@@ -175,16 +154,11 @@ def _call_variable_values(message: VapiMessage) -> dict[str, Any]:
 
 
 def _extract_summary_from_transcript(message: VapiMessage, decision: str | None = None) -> str:
-    """Deterministic, template-based Hebrew summary — no external/AI calls.
-    Passenger name and flight number come from call.assistantOverrides
-    (Vapi echoes back the variableValues used to create the call; see
-    _build_variable_values), falling back to generic phrasing when absent.
+    """Deterministic Hebrew summary template — no AI/external calls. Name
+    and flight come from call.assistantOverrides when available.
 
-    `decision`, if given, is the already-resolved final decision (e.g. from
-    a structuredOutputs bonus override) so the summary stays consistent
-    with whatever was actually written to passenger_decision, rather than
-    silently re-deriving a possibly different one from the transcript alone.
-    """
+    Pass `decision` when already resolved (e.g. via a structuredOutputs
+    override) so the summary matches what was actually stored."""
     if decision is None:
         decision = _extract_decision_from_transcript(message)
     decision_label = _DECISION_HEBREW_LABELS.get(
@@ -406,18 +380,12 @@ async def vapi_webhook(
         log_event(logger, logging.WARNING, "webhook_record_not_found", call_id=call_id)
         return {"status": "ignored"}
 
-    # structuredOutputs, when Vapi happens to have computed it in time, is a
-    # bonus override — transcript analysis is the reliable, always-available
-    # path (see _extract_decision for why structuredOutputs can't be trusted
-    # as primary).
+    # structuredOutputs is a bonus override; transcript is the reliable path.
     decision = _extract_decision(message)
     if decision == PassengerDecision.undecided.value:
         decision = _extract_decision_from_transcript(message)
 
-    # Pass the already-resolved `decision` through so the generated summary
-    # (if it comes to that) describes the same outcome that was just
-    # written to passenger_decision, not a possibly different one re-derived
-    # from the transcript alone.
+    # Keep the summary consistent with the decision just resolved above.
     summary = (
         _find_structured_result(message.structuredOutputs, "summary")
         or message.summary
