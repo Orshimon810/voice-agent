@@ -504,6 +504,36 @@ def test_extract_decision_from_transcript_case_insensitive_for_latin_text() -> N
     assert _extract_decision_from_transcript(message) == "refund"
 
 
+# --- definite article (ה-) normalization -------------------------------------
+# Regression coverage for a real production miss: "הטיסה החלופית" (article
+# prefixed to both words) didn't match the phrase "טיסה חלופית" at all,
+# since the phrase list has no article and substring matching is literal.
+# These stand alone (no other matching phrase in the sentence) specifically
+# so they can only pass via the article-stripping normalization, not by
+# accidentally matching some other phrase already in the list.
+
+
+def test_extract_decision_from_transcript_matches_article_prefixed_alternative_flight() -> None:
+    """The exact real transcript phrase that missed in production."""
+    message = _transcript_message([("user", "הטיסה החלופית")])
+    assert _extract_decision_from_transcript(message) == "alternative_flight"
+
+
+def test_extract_decision_from_transcript_matches_article_prefixed_refund() -> None:
+    message = _transcript_message([("user", "אני רוצה את ההחזר הכספי")])
+    assert _extract_decision_from_transcript(message) == "refund"
+
+
+def test_extract_decision_from_transcript_matches_article_prefixed_human_agent() -> None:
+    message = _transcript_message([("user", "תעבירו אותי בבקשה אל הנציג")])
+    assert _extract_decision_from_transcript(message) == "human_agent"
+
+
+def test_extract_decision_from_transcript_matches_article_prefixed_callback_requested() -> None:
+    message = _transcript_message([("user", "אין לי הזמן כרגע")])
+    assert _extract_decision_from_transcript(message) == "callback_requested"
+
+
 # --- _extract_summary_from_transcript ----------------------------------------
 
 
