@@ -502,7 +502,7 @@ def test_webhook_polls_vapi_and_recovers_structured_outputs_on_second_attempt(
 
 
 def test_webhook_falls_back_to_undecided_when_poll_exhausted(client: TestClient) -> None:
-    """All 3 poll attempts come back empty (or fail) — the handler must
+    """All 5 poll attempts come back empty (or fail) — the handler must
     still update call_status/timestamp/recording_url from the original
     webhook payload, leaving decision as undecided rather than giving up."""
     fake_airtable = FakeAirtableClient(SAMPLE_RECORD)
@@ -510,6 +510,8 @@ def test_webhook_falls_back_to_undecided_when_poll_exhausted(client: TestClient)
         call_responses=[
             {"id": "call_999", "structuredOutputs": {}},
             VapiError("Vapi is unavailable"),
+            {"id": "call_999", "structuredOutputs": None},
+            {"id": "call_999", "structuredOutputs": {}},
             {"id": "call_999", "structuredOutputs": None},
         ]
     )
@@ -528,7 +530,7 @@ def test_webhook_falls_back_to_undecided_when_poll_exhausted(client: TestClient)
     )
 
     assert response.status_code == 200
-    assert len(fake_vapi.get_call_calls) == 3
+    assert len(fake_vapi.get_call_calls) == 5
     fields = fake_airtable.updates[0][1]
     assert fields["passenger_decision"] == "undecided"
     assert fields["call_summary"] == ""
