@@ -3,8 +3,14 @@ import re
 from fastapi.testclient import TestClient
 
 from app.airtable import AirtableError
-from app.main import _extract_call_timestamp, app, get_airtable_client
-from app.models import PassengerRecord, VapiCall, VapiMessage
+from app.main import (
+    _extract_call_timestamp,
+    _extract_decision,
+    _find_structured_result,
+    app,
+    get_airtable_client,
+)
+from app.models import PassengerDecision, PassengerRecord, VapiAnalysis, VapiCall, VapiMessage
 
 _ISO8601_UTC_MS = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$")
 
@@ -44,7 +50,7 @@ def _end_of_call_report(
     call_id: str = "call_999",
     ended_reason: str = "customer-ended-call",
     structured_data: dict | None = None,
-    summary: str = "Passenger chose the alternative flight.",
+    summary: str | None = "Passenger chose the alternative flight.",
     recording_url: str = "https://recordings.vapi.ai/call_999.mp3",
 ) -> dict:
     return {
@@ -54,9 +60,20 @@ def _end_of_call_report(
             "call": {"id": call_id},
             "summary": summary,
             "recordingUrl": recording_url,
-            "analysis": {"structuredData": structured_data} if structured_data else None,
+            "analysis": {"structuredData": structured_data} if structured_data is not None else None,
         }
     }
+
+
+def _structured_data(*, decision: str | None = None, summary: str | None = None) -> dict:
+    """Build Vapi's real structuredData shape: random-UUID keys, each value a
+    {"name": ..., "result": ...} object."""
+    data: dict[str, dict] = {}
+    if decision is not None:
+        data["3fa85f64-5717-4562-b3fc-2c963f66afa6"] = {"name": "decision", "result": decision}
+    if summary is not None:
+        data["9c858901-8a57-4791-81fe-4c455b099bc9"] = {"name": "summary", "result": summary}
+    return data
 
 
 def test_webhook_wrong_secret_returns_401(client: TestClient) -> None:
@@ -136,7 +153,7 @@ def test_webhook_success_writes_completed_status_and_decision(client: TestClient
         "/webhooks/vapi",
         json=_end_of_call_report(
             ended_reason="customer-ended-call",
-            structured_data={"decision": "alternative_flight"},
+            structured_data=_structured_data(decision="alternative_flight"),
         ),
         headers={"x-vapi-secret": "secret"},
     )
@@ -201,12 +218,127 @@ def test_webhook_recognizes_callback_requested_decision(client: TestClient) -> N
 
     response = client.post(
         "/webhooks/vapi",
-        json=_end_of_call_report(structured_data={"decision": "callback_requested"}),
+        json=_end_of_call_report(structured_data=_structured_data(decision="callback_requested")),
         headers={"x-vapi-secret": "secret"},
     )
 
     assert response.status_code == 200
     assert fake_airtable.updates[0][1]["passenger_decision"] == "callback_requested"
+
+
+def test_find_structured_result_matches_uuid_keyed_entry() -> None:
+    structured = {
+        "3fa85f64-5717-4562-b3fc-2c963f66afa6": {"name": "decision", "result": "refund"},
+        "9c858901-8a57-4791-81fe-4c455b099bc9": {"name": "summary", "result": "some summary"},
+    }
+    assert _find_structured_result(structured, "decision") == "refund"
+    assert _find_structured_result(structured, "summary") == "some summary"
+
+
+def test_find_structured_result_returns_none_when_name_absent() -> None:
+    structured = {"3fa85f64-5717-4562-b3fc-2c963f66afa6": {"name": "decision", "result": "refund"}}
+    assert _find_structured_result(structured, "summary") is None
+
+
+def test_find_structured_result_handles_missing_or_empty_structured_data() -> None:
+    assert _find_structured_result(None, "decision") is None
+    assert _find_structured_result({}, "decision") is None
+
+
+def test_find_structured_result_ignores_malformed_entries() -> None:
+    structured = {
+        "not-a-dict-entry": "oops",
+        "missing-result": {"name": "decision"},
+        "non-string-result": {"name": "decision", "result": 42},
+    }
+    assert _find_structured_result(structured, "decision") is None
+
+
+def test_extract_decision_from_uuid_keyed_structured_data() -> None:
+    message = VapiMessage(
+        analysis=VapiAnalysis(
+            structuredData={
+                "3fa85f64-5717-4562-b3fc-2c963f66afa6": {"name": "decision", "result": "refund"},
+                "c3b2a1f0-1234-4abc-9def-0123456789ab": {
+                    "name": "some_other_field",
+                    "result": "irrelevant",
+                },
+            }
+        )
+    )
+    assert _extract_decision(message) == "refund"
+
+
+def test_extract_decision_defaults_to_undecided_for_unknown_result() -> None:
+    message = VapiMessage(
+        analysis=VapiAnalysis(
+            structuredData={
+                "3fa85f64-5717-4562-b3fc-2c963f66afa6": {
+                    "name": "decision",
+                    "result": "not_a_real_choice",
+                }
+            }
+        )
+    )
+    assert _extract_decision(message) == PassengerDecision.undecided.value
+
+
+def test_extract_decision_defaults_to_undecided_when_analysis_missing() -> None:
+    assert _extract_decision(VapiMessage()) == PassengerDecision.undecided.value
+
+
+def test_extract_decision_defaults_to_undecided_when_structured_data_empty() -> None:
+    message = VapiMessage(analysis=VapiAnalysis(structuredData={}))
+    assert _extract_decision(message) == PassengerDecision.undecided.value
+
+
+def test_webhook_extracts_decision_from_uuid_keyed_structured_data(client: TestClient) -> None:
+    fake_airtable = FakeAirtableClient(SAMPLE_RECORD)
+    app.dependency_overrides[get_airtable_client] = lambda: fake_airtable
+
+    response = client.post(
+        "/webhooks/vapi",
+        json=_end_of_call_report(structured_data=_structured_data(decision="human_agent")),
+        headers={"x-vapi-secret": "secret"},
+    )
+
+    assert response.status_code == 200
+    assert fake_airtable.updates[0][1]["passenger_decision"] == "human_agent"
+
+
+def test_webhook_extracts_summary_from_uuid_keyed_structured_data(client: TestClient) -> None:
+    fake_airtable = FakeAirtableClient(SAMPLE_RECORD)
+    app.dependency_overrides[get_airtable_client] = lambda: fake_airtable
+
+    response = client.post(
+        "/webhooks/vapi",
+        json=_end_of_call_report(
+            summary=None,
+            structured_data=_structured_data(summary="Passenger wants a callback."),
+        ),
+        headers={"x-vapi-secret": "secret"},
+    )
+
+    assert response.status_code == 200
+    assert fake_airtable.updates[0][1]["call_summary"] == "Passenger wants a callback."
+
+
+def test_webhook_empty_structured_data_defaults_to_undecided_and_empty_summary(
+    client: TestClient,
+) -> None:
+    fake_airtable = FakeAirtableClient(SAMPLE_RECORD)
+    app.dependency_overrides[get_airtable_client] = lambda: fake_airtable
+
+    response = client.post(
+        "/webhooks/vapi",
+        json=_end_of_call_report(summary=None, structured_data={}),
+        headers={"x-vapi-secret": "secret"},
+    )
+
+    assert response.status_code == 200
+    fields = fake_airtable.updates[0][1]
+    assert fields["passenger_decision"] == "undecided"
+    assert fields["call_summary"] == ""
 
 
 def test_extract_call_timestamp_prefers_top_level_ended_at() -> None:
@@ -264,7 +396,7 @@ def test_webhook_unrecognized_decision_defaults_to_undecided(client: TestClient)
 
     response = client.post(
         "/webhooks/vapi",
-        json=_end_of_call_report(structured_data={"decision": "not_a_real_choice"}),
+        json=_end_of_call_report(structured_data=_structured_data(decision="not_a_real_choice")),
         headers={"x-vapi-secret": "secret"},
     )
 

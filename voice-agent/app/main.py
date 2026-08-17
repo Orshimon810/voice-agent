@@ -32,13 +32,26 @@ logger = logging.getLogger(__name__)
 _VALID_DECISIONS = {member.value for member in PassengerDecision}
 
 
+def _find_structured_result(structured: dict[str, Any] | None, name: str) -> str | None:
+    """Look up a value in Vapi's structuredData, keyed by random UUIDs.
+
+    Each entry is shaped like {"name": <field name>, "result": <value>}
+    rather than the field name being the dict key directly.
+    """
+    if not structured:
+        return None
+    for entry in structured.values():
+        if isinstance(entry, dict) and entry.get("name") == name:
+            result = entry.get("result")
+            if isinstance(result, str):
+                return result
+    return None
+
+
 def _extract_decision(message: VapiMessage) -> str:
     structured = message.analysis.structuredData if message.analysis else None
-    if not structured:
-        return PassengerDecision.undecided.value
-
-    decision = structured.get("decision") or structured.get("passenger_decision")
-    if isinstance(decision, str) and decision in _VALID_DECISIONS:
+    decision = _find_structured_result(structured, "decision")
+    if decision is not None and decision in _VALID_DECISIONS:
         return decision
     return PassengerDecision.undecided.value
 
@@ -246,7 +259,13 @@ async def vapi_webhook(
         log_event(logger, logging.WARNING, "webhook_record_not_found", call_id=call_id)
         return {"status": "ignored"}
 
-    summary = message.summary or (message.analysis.summary if message.analysis else None) or ""
+    structured = message.analysis.structuredData if message.analysis else None
+    summary = (
+        message.summary
+        or _find_structured_result(structured, "summary")
+        or (message.analysis.summary if message.analysis else None)
+        or ""
+    )
     fields = {
         "call_status": _map_ended_reason(message.endedReason),
         "passenger_decision": _extract_decision(message),
