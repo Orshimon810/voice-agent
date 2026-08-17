@@ -43,6 +43,36 @@ def _extract_decision(message: VapiMessage) -> str:
     return PassengerDecision.undecided.value
 
 
+def _parse_timestamp(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def _format_call_timestamp(dt: datetime) -> str:
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    dt = dt.astimezone(timezone.utc)
+    return dt.strftime("%Y-%m-%dT%H:%M:%S.") + f"{dt.microsecond // 1000:03d}Z"
+
+
+def _extract_call_timestamp(message: VapiMessage) -> str:
+    candidates = [
+        message.endedAt,
+        message.call.endedAt if message.call else None,
+        message.startedAt,
+        message.call.startedAt if message.call else None,
+    ]
+    for candidate in candidates:
+        parsed = _parse_timestamp(candidate)
+        if parsed is not None:
+            return _format_call_timestamp(parsed)
+    return _format_call_timestamp(datetime.now(timezone.utc))
+
+
 def _map_ended_reason(ended_reason: str | None) -> str:
     if not ended_reason:
         return "completed"
@@ -221,7 +251,7 @@ async def vapi_webhook(
         "call_status": _map_ended_reason(message.endedReason),
         "passenger_decision": _extract_decision(message),
         "call_summary": summary,
-        "call_timestamp": datetime.now(timezone.utc).isoformat(),
+        "call_timestamp": _extract_call_timestamp(message),
         "recording_url": message.recordingUrl or "",
     }
 

@@ -1,8 +1,12 @@
+import re
+
 from fastapi.testclient import TestClient
 
 from app.airtable import AirtableError
-from app.main import app, get_airtable_client
-from app.models import PassengerRecord
+from app.main import _extract_call_timestamp, app, get_airtable_client
+from app.models import PassengerRecord, VapiCall, VapiMessage
+
+_ISO8601_UTC_MS = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$")
 
 SAMPLE_RECORD = PassengerRecord(
     record_id="recABC123",
@@ -203,6 +207,55 @@ def test_webhook_recognizes_callback_requested_decision(client: TestClient) -> N
 
     assert response.status_code == 200
     assert fake_airtable.updates[0][1]["passenger_decision"] == "callback_requested"
+
+
+def test_extract_call_timestamp_prefers_top_level_ended_at() -> None:
+    message = VapiMessage(
+        endedAt="2026-08-17T12:03:00.000Z",
+        call=VapiCall(endedAt="2026-08-17T13:00:00.000Z"),
+    )
+    assert _extract_call_timestamp(message) == "2026-08-17T12:03:00.000Z"
+
+
+def test_extract_call_timestamp_falls_back_to_call_ended_at() -> None:
+    message = VapiMessage(call=VapiCall(endedAt="2026-08-17T13:00:00.000Z"))
+    assert _extract_call_timestamp(message) == "2026-08-17T13:00:00.000Z"
+
+
+def test_extract_call_timestamp_falls_back_to_started_at() -> None:
+    message = VapiMessage(call=VapiCall(startedAt="2026-08-17T11:00:00.000Z"))
+    assert _extract_call_timestamp(message) == "2026-08-17T11:00:00.000Z"
+
+
+def test_extract_call_timestamp_normalizes_offset_to_utc_z() -> None:
+    message = VapiMessage(endedAt="2026-08-17T14:03:00+02:00")
+    assert _extract_call_timestamp(message) == "2026-08-17T12:03:00.000Z"
+
+
+def test_extract_call_timestamp_defaults_to_now_when_missing() -> None:
+    assert _ISO8601_UTC_MS.match(_extract_call_timestamp(VapiMessage()))
+
+
+def test_extract_call_timestamp_defaults_to_now_when_malformed() -> None:
+    message = VapiMessage(endedAt="not-a-timestamp")
+    assert _ISO8601_UTC_MS.match(_extract_call_timestamp(message))
+
+
+def test_webhook_writes_iso8601_utc_call_timestamp_from_call_ended_at(
+    client: TestClient,
+) -> None:
+    fake_airtable = FakeAirtableClient(SAMPLE_RECORD)
+    app.dependency_overrides[get_airtable_client] = lambda: fake_airtable
+
+    payload = _end_of_call_report()
+    payload["message"]["call"] = {"id": "call_999", "endedAt": "2026-08-17T12:03:00.000Z"}
+
+    response = client.post(
+        "/webhooks/vapi", json=payload, headers={"x-vapi-secret": "secret"}
+    )
+
+    assert response.status_code == 200
+    assert fake_airtable.updates[0][1]["call_timestamp"] == "2026-08-17T12:03:00.000Z"
 
 
 def test_webhook_unrecognized_decision_defaults_to_undecided(client: TestClient) -> None:
