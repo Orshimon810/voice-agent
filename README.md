@@ -276,6 +276,20 @@ arrive.
 assistant configuration and system prompt for this project, included for assignment
 submission purposes. `assistant_export.json` has had its webhook secret redacted.
 
+## `recordings/` directory
+
+`recordings/` contains the audio recordings of the three real outbound test calls
+referenced in the submission, one per passenger decision outcome: `Yonathan_Cohen.wav`
+(`refund`), `Roni_Levi.wav` (`alternative_flight`), and `David_Avraham.wav`
+(`human_agent`).
+
+## `submission/` directory
+
+`submission/` contains the assignment deliverables: `elal_voice_agent.pdf`, the
+presentation covering the use cases, model comparison, architecture, and business
+value, and `outbound_calls_log.csv.csv`, a CSV export from Airtable showing the three
+example call records from `recordings/` with their outcomes.
+
 ## Development Workflow
 
 This project was built using a feature-branch-per-component workflow: each change
@@ -301,6 +315,13 @@ voice-agent/
 │   ├── models.py                # Pydantic models
 │   ├── retry.py                  # shared exponential-backoff retry policy
 │   └── logging_config.py         # structured (JSON) logging setup
+├── recordings/
+│   ├── Yonathan_Cohen.wav      # test call recording (refund)
+│   ├── Roni_Levi.wav           # test call recording (alternative_flight)
+│   └── David_Avraham.wav       # test call recording (human_agent)
+├── submission/
+│   ├── elal_voice_agent.pdf         # presentation: use cases, model comparison, architecture, business value
+│   └── outbound_calls_log.csv.csv   # Airtable export of the three call records with outcomes
 ├── tests/
 │   ├── conftest.py
 │   ├── test_hebrew.py
