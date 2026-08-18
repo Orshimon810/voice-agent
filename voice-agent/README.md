@@ -281,7 +281,10 @@ submission purposes. `assistant_export.json` has had its webhook secret redacted
 `recordings/` contains the audio recordings of the three real outbound test calls
 referenced in the submission, one per passenger decision outcome: `Yonathan_Cohen.wav`
 (`refund`), `Roni_Levi.wav` (`alternative_flight`), and `David_Avraham.wav`
-(`human_agent`).
+(`human_agent`). The assignment only requires at least one successful recording
+(section 1.4.9); all three here are successful calls, provided as additional examples
+beyond that minimum — pick whichever decision outcome you want to hear without needing
+to play all three.
 
 ## `submission/` directory
 
