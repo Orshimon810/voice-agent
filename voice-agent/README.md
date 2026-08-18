@@ -287,7 +287,7 @@ referenced in the submission, one per passenger decision outcome: `Yonathan_Cohe
 
 `submission/` contains the assignment deliverables: `elal_voice_agent.pdf`, the
 presentation covering the use cases, model comparison, architecture, and business
-value, and `outbound_calls_log.csv.csv`, a CSV export from Airtable showing the three
+value, and `outbound_calls_log.csv`, a CSV export from Airtable showing the three
 example call records from `recordings/` with their outcomes.
 
 ## Development Workflow
@@ -321,7 +321,7 @@ voice-agent/
 │   └── David_Avraham.wav       # test call recording (human_agent)
 ├── submission/
 │   ├── elal_voice_agent.pdf         # presentation: use cases, model comparison, architecture, business value
-│   └── outbound_calls_log.csv.csv   # Airtable export of the three call records with outcomes
+│   └── outbound_calls_log.csv       # Airtable export of the three call records with outcomes
 ├── tests/
 │   ├── conftest.py
 │   ├── test_hebrew.py
