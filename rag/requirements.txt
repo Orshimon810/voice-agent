@@ -1,0 +1,5 @@
+openai>=1.30
+pypdf>=4.2
+python-dotenv>=1.0
+numpy>=1.26
+pytest>=8.2
